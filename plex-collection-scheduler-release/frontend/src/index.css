@@ -1,0 +1,109 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  font-family: Inter, system-ui, Avenir, Helvetica, Arial, sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+  color-scheme: dark;
+  color: rgba(255, 255, 255, 0.87);
+  background-color: #181818;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #1f1f1f;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #3f3f3f;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #4f4f4f;
+}
+
+/* FullCalendar overrides */
+.fc {
+  --fc-border-color: #3f3f3f;
+  --fc-button-bg-color: #282828;
+  --fc-button-border-color: #3f3f3f;
+  --fc-button-hover-bg-color: #383838;
+  --fc-button-hover-border-color: #4f4f4f;
+  --fc-button-active-bg-color: #e5a00d;
+  --fc-button-active-border-color: #e5a00d;
+  --fc-event-bg-color: #e5a00d;
+  --fc-event-border-color: #cc7b19;
+  --fc-today-bg-color: rgba(229, 160, 13, 0.1);
+  --fc-page-bg-color: #1f1f1f;
+  --fc-neutral-bg-color: #282828;
+  --fc-neutral-text-color: rgba(255, 255, 255, 0.87);
+}
+
+.fc-theme-standard td,
+.fc-theme-standard th {
+  border-color: #3f3f3f;
+}
+
+.fc-col-header-cell {
+  background-color: #282828;
+}
+
+.fc-daygrid-day-number {
+  color: rgba(255, 255, 255, 0.87);
+}
+
+.fc-event {
+  cursor: pointer;
+}
+
+/* Drag handle */
+.drag-handle {
+  cursor: grab;
+}
+
+.drag-handle:active {
+  cursor: grabbing;
+}
+
+/* Badge styles */
+.badge {
+  @apply inline-flex items-center px-2 py-0.5 rounded text-xs font-medium;
+}
+
+.badge-plex {
+  @apply bg-plex-gold/20 text-plex-gold;
+}
+
+.badge-kometa {
+  @apply bg-purple-500/20 text-purple-400;
+}
+
+.badge-both {
+  @apply bg-blue-500/20 text-blue-400;
+}
+
+.badge-active {
+  @apply bg-green-500/20 text-green-400;
+}
+
+.badge-scheduled {
+  @apply bg-yellow-500/20 text-yellow-400;
+}
