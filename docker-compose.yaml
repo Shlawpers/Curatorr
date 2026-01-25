@@ -5,7 +5,8 @@
 
 services:
   curatorr:
-    build: .
+    image: ghcr.io/shlawpers/curatorr:latest
+    # build: .  # uncomment to build from source instead
     container_name: curatorr
     ports:
       - "${PORT:-3000}:5100"
