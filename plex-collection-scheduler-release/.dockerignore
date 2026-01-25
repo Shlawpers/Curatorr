@@ -1,0 +1,44 @@
+# Git
+.git
+.gitignore
+
+# Documentation & planning files
+*.md
+*.png
+
+# Development files
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+.venv
+venv
+*.egg-info
+
+# Node
+node_modules
+.npm
+
+# Build artifacts
+frontend/dist
+backend/data
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test/Backup files
+*.backup*
+*-backup-*
+*.bak
+.claude

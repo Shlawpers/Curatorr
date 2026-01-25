@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+*.egg-info/
+
+# Node
+node_modules/
+dist/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env files (keep .env.example)
+.env
+!.env.example
+
+# Database
+*.db
+*.db.backup
+*.db.v1-backup
+
+# Logs
+*.log
+
+# Screenshots (temporary)
+*.png
