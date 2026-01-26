@@ -24,6 +24,9 @@ Thumbs.db
 .env
 !.env.example
 
+# Internal development notes
+ROADMAP.md
+
 # Database
 *.db
 *.db.backup
@@ -34,3 +37,4 @@ Thumbs.db
 
 # Screenshots (temporary)
 *.png
+.venv/

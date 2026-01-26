@@ -5,8 +5,8 @@
 
 services:
   curatorr:
-    image: ghcr.io/shlawpers/curatorr:latest
-    # build: .  # uncomment to build from source instead
+    # image: ghcr.io/shlawpers/curatorr:latest
+    build: .
     container_name: curatorr
     ports:
       - "${PORT:-3000}:5100"
@@ -16,6 +16,10 @@ services:
       - KOMETA_CONFIG_PATH=/kometa/config
       - APPLY_MODE=${APPLY_MODE:-dry-run}
       - TZ=${TZ:-UTC}
+      # Optional authentication (uncomment to enable)
+      - CURATORR_AUTH_ENABLED=${CURATORR_AUTH_ENABLED:-false}
+      - CURATORR_AUTH_PASSWORD=${CURATORR_AUTH_PASSWORD:-}
+      - CURATORR_SESSION_SECRET=${CURATORR_SESSION_SECRET:-}
     volumes:
       - curatorr-data:/app/data
       # Uncomment to enable Kometa conflict detection:

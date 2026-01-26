@@ -58,6 +58,12 @@ class Settings(BaseSettings):
     # Feature flags
     simulate_reorder_failure: bool = False  # For testing error paths
 
+    # Authentication (optional - disabled by default)
+    # Set CURATORR_AUTH_ENABLED=true to require password login
+    auth_enabled: bool = False
+    auth_password: str = ""  # Required if auth_enabled is true
+    session_secret: str = "curatorr-dev-secret-change-in-production"  # For signing session cookies
+
     def ensure_data_dir(self):
         """Ensure the data directory exists for the database."""
         data_dir = os.path.dirname(self.database_path)

@@ -1,13 +1,19 @@
 """Main FastAPI application for Plex Collection Scheduler."""
 import os
 import uuid
+import secrets
+import hashlib
+import hmac
+import base64
+import json
 from datetime import datetime, date, time, timedelta
 from pathlib import Path
 from typing import Optional
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, Response, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
 import logging
 
@@ -46,6 +52,11 @@ from models import (
     LibrarySyncSettingsUpdate,
     ApplyIfNeededResult,
     SyncResultStatus,
+    Promotion,
+    PromotionItem,
+    PromotionCreate,
+    PromotionUpdate,
+    PromotionItemSave,
 )
 import database as db
 from database import (
@@ -59,6 +70,7 @@ from database import (
     create_layout_block,
     update_layout_block,
     delete_layout_block,
+    duplicate_layout_block,
     get_layout_block_items,
     save_layout_block_items,
     get_active_layout_block,
@@ -68,8 +80,129 @@ from database import (
     get_all_enabled_sync_libraries,
     update_sync_status,
     get_rollback_snapshot,
+    # Promotions
+    init_promotions_tables,
+    get_promotions,
+    get_promotion,
+    create_promotion,
+    update_promotion,
+    delete_promotion,
+    get_promotion_items,
+    save_promotion_items,
+    get_active_promotions,
+    # Saved Layouts
+    get_saved_layouts,
+    get_saved_layout,
+    create_saved_layout,
+    delete_saved_layout,
 )
 from sync_scheduler import scheduler
+
+# ================== Promotion Merge Helper ==================
+
+class MergedLayoutItem:
+    """Represents a merged item from promotions and/or layout blocks."""
+    def __init__(
+        self,
+        hub_identifier: str,
+        visible_home: bool,
+        visible_shared_home: bool,
+        visible_shared_friends: bool,
+        source: str,  # "promotion" or "block"
+        source_name: str = "",  # Promotion name or block name
+    ):
+        self.hub_identifier = hub_identifier
+        self.visible_home = visible_home
+        self.visible_shared_home = visible_shared_home
+        self.visible_shared_friends = visible_shared_friends
+        self.source = source
+        self.source_name = source_name
+
+
+async def get_merged_layout(
+    section_id: str,
+    at_time: datetime
+) -> tuple[list[MergedLayoutItem], list["Promotion"], "LayoutBlock | None"]:
+    """
+    Compute the merged layout for a given time, combining promotions and layout blocks.
+
+    Priority Stack (Runtime):
+    - PROMOTIONS (top layer) - Always applies if active, inserted at top
+    - SCHEDULED BLOCK - Replaces base if active
+    - CURRENT PLEX STATE - Used as base when no block is active
+
+    Returns:
+        Tuple of (merged_items, active_promotions, active_block)
+    """
+    # Get active layout block
+    active_block = await get_active_layout_block(section_id, at_time)
+
+    # Get active promotions
+    active_promotions = await get_active_promotions(section_id, at_time)
+
+    # Build merged list
+    merged_items = []
+    seen_hub_ids = set()
+
+    # 1. Add promotion items FIRST (they go at the top)
+    # Sort promotions by start_at (earliest first) for consistent ordering
+    sorted_promotions = sorted(active_promotions, key=lambda p: p.start_at)
+
+    for promo in sorted_promotions:
+        # Sort items by order_index
+        sorted_items = sorted(promo.items, key=lambda i: i.order_index)
+        for item in sorted_items:
+            if item.hub_identifier not in seen_hub_ids:
+                merged_items.append(MergedLayoutItem(
+                    hub_identifier=item.hub_identifier,
+                    visible_home=item.visible_home,
+                    visible_shared_home=item.visible_shared_home,
+                    visible_shared_friends=item.visible_shared_friends,
+                    source="promotion",
+                    source_name=promo.name,
+                ))
+                seen_hub_ids.add(item.hub_identifier)
+
+    # 2. Add base layer items AFTER promotions (excluding duplicates)
+    if active_block and active_block.items:
+        # Use layout block as base
+        sorted_block_items = sorted(active_block.items, key=lambda i: i.order_index)
+        for item in sorted_block_items:
+            hub_id = item.collection_id
+            if hub_id not in seen_hub_ids:
+                merged_items.append(MergedLayoutItem(
+                    hub_identifier=hub_id,
+                    visible_home=item.visible_home,
+                    visible_shared_home=item.visible_shared_home,
+                    visible_shared_friends=item.visible_shared_friends,
+                    source="block",
+                    source_name=active_block.name,
+                ))
+                seen_hub_ids.add(hub_id)
+    elif active_promotions:
+        # No block active but promotions exist - use current Plex state as base
+        # This allows promotions to overlay on top of whatever is currently showing
+        try:
+            current_state = await plex_client.get_managed_hubs(section_id)
+            for hub in current_state.hubs:
+                if hub.hub_identifier not in seen_hub_ids:
+                    # Only include currently promoted hubs as base
+                    if hub.promoted:
+                        merged_items.append(MergedLayoutItem(
+                            hub_identifier=hub.hub_identifier,
+                            visible_home=hub.promoted_to_own_home,
+                            visible_shared_home=hub.promoted_to_shared_home,
+                            visible_shared_friends=hub.promoted_to_recommended,
+                            source="plex",
+                            source_name="Current Plex State",
+                        ))
+                        seen_hub_ids.add(hub.hub_identifier)
+        except Exception as e:
+            # If we can't fetch Plex state, just use promotion items only
+            logger.warning(f"Could not fetch current Plex state for base: {e}")
+
+    return merged_items, active_promotions, active_block
+
 
 # Configure logging
 logging.basicConfig(
@@ -98,6 +231,159 @@ app.add_middleware(
 )
 
 
+# ================== Authentication ==================
+
+# Session cookie settings
+SESSION_COOKIE_NAME = "curatorr_session"
+SESSION_EXPIRY_HOURS = 24
+
+
+def create_session_token() -> str:
+    """Create a signed session token."""
+    payload = {
+        "created_at": datetime.utcnow().isoformat(),
+        "random": secrets.token_hex(16),
+    }
+    payload_json = json.dumps(payload)
+    payload_b64 = base64.b64encode(payload_json.encode()).decode()
+    # Create HMAC signature
+    signature = hmac.new(
+        settings.session_secret.encode(),
+        payload_b64.encode(),
+        hashlib.sha256
+    ).hexdigest()
+    return f"{payload_b64}.{signature}"
+
+
+def verify_session_token(token: str) -> bool:
+    """Verify a session token is valid and not expired."""
+    try:
+        parts = token.split(".")
+        if len(parts) != 2:
+            return False
+        payload_b64, signature = parts
+        # Verify signature
+        expected_sig = hmac.new(
+            settings.session_secret.encode(),
+            payload_b64.encode(),
+            hashlib.sha256
+        ).hexdigest()
+        if not hmac.compare_digest(signature, expected_sig):
+            return False
+        # Check expiry
+        payload_json = base64.b64decode(payload_b64).decode()
+        payload = json.loads(payload_json)
+        created_at = datetime.fromisoformat(payload["created_at"])
+        if datetime.utcnow() - created_at > timedelta(hours=SESSION_EXPIRY_HOURS):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+class AuthMiddleware(BaseHTTPMiddleware):
+    """Middleware to check authentication on protected routes."""
+
+    # Routes that don't require authentication
+    PUBLIC_PATHS = {
+        "/api/auth/login",
+        "/api/auth/logout",
+        "/api/auth/status",
+        "/api/health",
+    }
+
+    async def dispatch(self, request: Request, call_next):
+        # If auth is disabled, skip all checks
+        if not settings.auth_enabled:
+            return await call_next(request)
+
+        # Check if path is public
+        path = request.url.path
+        if path in self.PUBLIC_PATHS:
+            return await call_next(request)
+
+        # Allow static files and non-API routes
+        if not path.startswith("/api/"):
+            return await call_next(request)
+
+        # Check for valid session cookie
+        session_token = request.cookies.get(SESSION_COOKIE_NAME)
+        if not session_token or not verify_session_token(session_token):
+            return JSONResponse(
+                status_code=401,
+                content={"error": "Not authenticated", "auth_required": True}
+            )
+
+        return await call_next(request)
+
+
+# Add auth middleware (must be added after CORS)
+app.add_middleware(AuthMiddleware)
+
+
+# Auth request/response models
+class LoginRequest(BaseModel):
+    password: str
+
+
+class AuthStatusResponse(BaseModel):
+    auth_enabled: bool
+    authenticated: bool
+
+
+@app.get("/api/auth/status")
+async def auth_status(request: Request) -> AuthStatusResponse:
+    """Check authentication status."""
+    authenticated = False
+    if settings.auth_enabled:
+        session_token = request.cookies.get(SESSION_COOKIE_NAME)
+        if session_token and verify_session_token(session_token):
+            authenticated = True
+    else:
+        # If auth is disabled, consider user authenticated
+        authenticated = True
+
+    return AuthStatusResponse(
+        auth_enabled=settings.auth_enabled,
+        authenticated=authenticated
+    )
+
+
+@app.post("/api/auth/login")
+async def login(request: LoginRequest, response: Response):
+    """Login with password."""
+    if not settings.auth_enabled:
+        return {"success": True, "message": "Auth is disabled"}
+
+    if not settings.auth_password:
+        raise HTTPException(
+            status_code=500,
+            detail="Auth is enabled but no password is configured. Set CURATORR_AUTH_PASSWORD."
+        )
+
+    # Constant-time comparison to prevent timing attacks
+    if not hmac.compare_digest(request.password, settings.auth_password):
+        raise HTTPException(status_code=401, detail="Invalid password")
+
+    # Create session token and set cookie
+    token = create_session_token()
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=token,
+        httponly=True,
+        max_age=SESSION_EXPIRY_HOURS * 3600,
+        samesite="lax",
+    )
+    return {"success": True}
+
+
+@app.post("/api/auth/logout")
+async def logout(response: Response):
+    """Logout and clear session."""
+    response.delete_cookie(key=SESSION_COOKIE_NAME)
+    return {"success": True}
+
+
 # ================== Startup ==================
 
 @app.on_event("startup")
@@ -106,6 +392,7 @@ async def startup():
     await db.init_database()
     await init_layout_blocks_tables()
     await init_sync_settings_table()
+    await init_promotions_tables()
     # Start the background scheduler
     await scheduler.start()
     logger.info(f"Plex Collection Scheduler started (mode: {settings.apply_mode})")
@@ -625,11 +912,13 @@ async def get_diff(
     at: Optional[str] = Query(None, description="ISO datetime, defaults to now")
 ):
     """
-    Compute the diff between current Plex state and target Layout Block.
+    Compute the diff between current Plex state and target merged layout.
 
-    Uses Layout Blocks model:
-    - If no active block at target time: returns 0 changes (dead time)
-    - If active block: compares current Plex state to block's desired state
+    Uses merged layout (Promotions + Layout Blocks):
+    - Gets active promotions and active layout block at target time
+    - Merges: Promotion items at TOP, then block items (excluding duplicates)
+    - If no active block AND no active promotions: returns dead time
+    - Compares merged layout to current Plex state
     """
     try:
         if at:
@@ -637,17 +926,20 @@ async def get_diff(
         else:
             target_time = datetime.now()
 
-        # Find active layout block at the given time
-        active_block = await get_active_layout_block(section_id, target_time)
+        # Get merged layout (promotions + block)
+        merged_items, active_promotions, active_block = await get_merged_layout(
+            section_id, target_time
+        )
 
-        if not active_block:
-            # Dead time - no active block, no changes to apply
+        # Check for dead time (no block AND no promotions)
+        if not active_block and not active_promotions:
             return {
                 "computed_at": datetime.now().isoformat(),
                 "target_time": target_time.isoformat(),
                 "library_section_id": section_id,
                 "no_active_block": True,
-                "message": "No active layout block at this time (dead time). No changes will be applied.",
+                "active_promotions": [],
+                "message": "No active layout block or promotions at this time (dead time). No changes will be applied.",
                 "visibility_changes": [],
                 "order_changes": [],
                 "total_changes": 0,
@@ -655,16 +947,17 @@ async def get_diff(
                 "conflict_messages": [],
             }
 
-        if not active_block.items:
-            # Block exists but has no items configured
+        # If we have promotions but no block, that's still valid
+        if not merged_items:
             return {
                 "computed_at": datetime.now().isoformat(),
                 "target_time": target_time.isoformat(),
                 "library_section_id": section_id,
-                "no_active_block": False,
-                "active_block_id": active_block.id,
-                "active_block_name": active_block.name,
-                "message": "Active block has no items configured.",
+                "no_active_block": active_block is None,
+                "active_block_id": active_block.id if active_block else None,
+                "active_block_name": active_block.name if active_block else None,
+                "active_promotions": [{"id": p.id, "name": p.name} for p in active_promotions],
+                "message": "No items configured in active block or promotions.",
                 "visibility_changes": [],
                 "order_changes": [],
                 "total_changes": 0,
@@ -697,39 +990,41 @@ async def get_diff(
         for hub in current_state.hubs:
             current_hubs_by_title[hub.title] = hub.hub_identifier
 
-        # Compare current state to block's desired state
+        # Compare current state to merged desired state
         visibility_changes = []
         order_changes = []
 
         # Build list of desired promoted hubs in order (only visible items)
         # This is the target order for Plex's promoted hub list
-        desired_promoted_order = []  # List of (hub_id, item) tuples
+        desired_promoted_order = []  # List of (hub_id, merged_item, title) tuples
         desired_promoted_hubs = set()
 
         # Track collections that can't be managed (not in Plex managed hubs)
         unmanaged_collections = []
 
-        for item in active_block.items:
-            # Find the hub identifier for this collection
+        for merged_item in merged_items:
+            # Find the hub identifier for this item
             hub_id = None
 
-            # Method 1: Direct match - collection_id should BE the hub_identifier
-            if item.collection_id in current_hubs:
-                hub_id = item.collection_id
+            # Method 1: Direct match - hub_identifier should BE in current_hubs
+            if merged_item.hub_identifier in current_hubs:
+                hub_id = merged_item.hub_identifier
 
             # Method 2: Find by collection ID in hub_key (legacy support)
             if not hub_id:
                 for h in current_state.hubs:
-                    if f"collections/{item.collection_id}" in h.hub_key:
+                    if f"collections/{merged_item.hub_identifier}" in h.hub_key:
                         hub_id = h.hub_identifier
                         break
 
             if not hub_id:
                 # This collection is not in Plex's managed hubs list
                 # It needs to be promoted via Plex UI first
-                logger.warning(f"Could not find hub for collection_id={item.collection_id}")
+                logger.warning(f"Could not find hub for hub_identifier={merged_item.hub_identifier}")
                 unmanaged_collections.append({
-                    "collection_id": item.collection_id,
+                    "hub_identifier": merged_item.hub_identifier,
+                    "source": merged_item.source,
+                    "source_name": merged_item.source_name,
                     "reason": "Not in Plex managed hubs. Must be promoted via Plex UI first."
                 })
                 continue
@@ -746,56 +1041,59 @@ async def get_diff(
             # visible_shared_home -> promotedToSharedHome
             # visible_shared_friends -> promotedToRecommended
             vis_changed = (
-                hub.promoted_to_own_home != item.visible_home or
-                hub.promoted_to_shared_home != item.visible_shared_home or
-                hub.promoted_to_recommended != item.visible_shared_friends
+                hub.promoted_to_own_home != merged_item.visible_home or
+                hub.promoted_to_shared_home != merged_item.visible_shared_home or
+                hub.promoted_to_recommended != merged_item.visible_shared_friends
             )
 
             if vis_changed:
                 # Summarize as "home" if visible_home is true, "hidden" otherwise
                 from_state = "home" if hub.promoted_to_own_home else "hidden"
-                to_state = "home" if item.visible_home else "hidden"
+                to_state = "home" if merged_item.visible_home else "hidden"
                 visibility_changes.append({
-                    "collection_id": item.collection_id,
                     "hub_identifier": hub_id,
                     "title": title,
                     "from": from_state,
                     "to": to_state,
+                    "source": merged_item.source,
+                    "source_name": merged_item.source_name,
                 })
 
             # Only add to promoted order if visible_home is true
             # (promotedToOwnHome controls whether it appears on YOUR home)
-            if item.visible_home:
-                desired_promoted_order.append((hub_id, item, title))
+            if merged_item.visible_home:
+                desired_promoted_order.append((hub_id, merged_item, title))
                 desired_promoted_hubs.add(hub_id)
 
         # Check order changes by comparing desired promoted order to current
-        for desired_pos, (hub_id, item, title) in enumerate(desired_promoted_order):
+        for desired_pos, (hub_id, merged_item, title) in enumerate(desired_promoted_order):
             current_hub = current_hubs.get(hub_id)
             if current_hub:
                 current_pos = current_hub["position"]
                 if current_pos != desired_pos:
                     order_changes.append({
-                        "collection_id": item.collection_id,
                         "hub_identifier": hub_id,
                         "title": title,
                         "from_position": current_pos,
                         "to_position": desired_pos,
+                        "source": merged_item.source,
+                        "source_name": merged_item.source_name,
                     })
 
-        # Check for items currently promoted but not in the block (should be hidden)
+        # Check for items currently promoted but not in the merged layout (should be hidden)
         # Track hubs we've already processed to avoid duplicates
-        processed_hub_ids = {item.collection_id for item in active_block.items if item.collection_id}
+        processed_hub_ids = {item.hub_identifier for item in merged_items}
         for hub_id, hub_info in current_hubs.items():
             if hub_info["promoted"] and hub_id not in desired_promoted_hubs and hub_id not in processed_hub_ids:
-                # This hub is promoted in Plex but not in our block - should be hidden
+                # This hub is promoted in Plex but not in our merged layout - should be hidden
                 hub = hub_info["hub"]
                 visibility_changes.append({
-                    "collection_id": None,
                     "hub_identifier": hub_id,
                     "title": hub.title,
                     "from": "home",
                     "to": "hidden",
+                    "source": "auto",
+                    "source_name": "Not in active layout",
                 })
 
         total_changes = len(visibility_changes) + (1 if order_changes else 0)
@@ -805,16 +1103,17 @@ async def get_diff(
         if unmanaged_collections:
             for uc in unmanaged_collections:
                 warnings.append(
-                    f"Collection '{uc['collection_id']}' cannot be managed: {uc['reason']}"
+                    f"Item '{uc['hub_identifier']}' from {uc['source']} '{uc['source_name']}' cannot be managed: {uc['reason']}"
                 )
 
         return {
             "computed_at": datetime.now().isoformat(),
             "target_time": target_time.isoformat(),
             "library_section_id": section_id,
-            "no_active_block": False,
-            "active_block_id": active_block.id,
-            "active_block_name": active_block.name,
+            "no_active_block": active_block is None,
+            "active_block_id": active_block.id if active_block else None,
+            "active_block_name": active_block.name if active_block else None,
+            "active_promotions": [{"id": p.id, "name": p.name, "repeat_yearly": p.repeat_yearly} for p in active_promotions],
             "visibility_changes": visibility_changes,
             "order_changes": order_changes,
             "total_changes": total_changes,
@@ -831,12 +1130,13 @@ async def get_diff(
 @app.post("/api/libraries/{section_id}/apply")
 async def apply_changes(section_id: str):
     """
-    Apply the active Layout Block's state to Plex.
+    Apply the merged layout (promotions + block) to Plex.
 
-    Uses Layout Blocks model:
-    - Finds active LayoutBlock at current time
-    - If no active block: returns 409 (dead time - cannot apply)
-    - If active: applies the block's visibility and order to Plex
+    Uses merged layout model:
+    - Gets active promotions and layout block at current time
+    - Merges: Promotion items at TOP, then block items (excluding duplicates)
+    - If no active block AND no promotions: returns 409 (dead time)
+    - Applies the merged visibility and order to Plex
     - Creates rollback snapshot before applying
     - Verifies reorder succeeded
     """
@@ -849,25 +1149,35 @@ async def apply_changes(section_id: str):
     try:
         now = datetime.now()
 
-        # Find active layout block
-        active_block = await get_active_layout_block(section_id, now)
+        # Get merged layout (promotions + block)
+        merged_items, active_promotions, active_block = await get_merged_layout(
+            section_id, now
+        )
 
-        if not active_block:
-            # Dead time - no active block
+        # Check for dead time (no block AND no promotions)
+        if not active_block and not active_promotions:
             raise HTTPException(
                 status_code=409,
-                detail="No active layout block at this time (dead time). Cannot apply changes."
+                detail="No active layout block or promotions at this time (dead time). Cannot apply changes."
             )
 
-        if not active_block.items:
-            # Block has no items
+        if not merged_items:
             raise HTTPException(
                 status_code=409,
-                detail=f"Layout block '{active_block.name}' has no items configured. Cannot apply."
+                detail="No items configured in active block or promotions. Cannot apply."
             )
 
         # Get current state for rollback snapshot
         current_state = await plex_client.get_managed_hubs(section_id)
+
+        # Build snapshot note
+        snapshot_note_parts = []
+        if active_block:
+            snapshot_note_parts.append(f"block '{active_block.name}'")
+        if active_promotions:
+            promo_names = [p.name for p in active_promotions]
+            snapshot_note_parts.append(f"promotions [{', '.join(promo_names)}]")
+        snapshot_note = f"Pre-apply snapshot for {' + '.join(snapshot_note_parts)} at {now.isoformat()}"
 
         # Create rollback snapshot
         rollback = RollbackSnapshot(
@@ -883,7 +1193,7 @@ async def apply_changes(section_id: str):
                 }
                 for h in current_state.hubs
             },
-            note=f"Pre-apply snapshot for block '{active_block.name}' at {now.isoformat()}",
+            note=snapshot_note,
         )
         await db.save_rollback_snapshot(rollback)
 
@@ -892,9 +1202,8 @@ async def apply_changes(section_id: str):
         collection_map = {c.id: c for c in collections}
 
         # Build current state maps
-        current_hubs_by_title = {}
-        for hub in current_state.hubs:
-            current_hubs_by_title[hub.title] = hub
+        current_hubs_by_id = {h.hub_identifier: h for h in current_state.hubs}
+        current_hubs_by_title = {h.title: h for h in current_state.hubs}
 
         # Initialize result
         result = ApplyResult(
@@ -902,7 +1211,7 @@ async def apply_changes(section_id: str):
             timestamp=now,
             library_section_id=section_id,
             before_order=current_state.hub_order,
-            desired_order=[item.collection_id for item in active_block.items],
+            desired_order=[item.hub_identifier for item in merged_items],
         )
 
         # Build list of desired hub identifiers and their promoted state
@@ -919,33 +1228,31 @@ async def apply_changes(section_id: str):
         # Track unmanaged collections (not in Plex managed hubs)
         unmanaged_collections = []
 
-        # Helper to extract ratingKey from collection_id
-        def extract_rating_key(collection_id: str) -> str:
-            """Extract the ratingKey from a collection_id.
+        # Helper to extract ratingKey from hub_identifier
+        def extract_rating_key(hub_identifier: str) -> str:
+            """Extract the ratingKey from a hub_identifier.
             'custom.collection.3.138563' -> '138563'
             '138563' -> '138563'
             """
-            if '.' in collection_id:
-                parts = collection_id.split('.')
+            if '.' in hub_identifier:
+                parts = hub_identifier.split('.')
                 return parts[-1]
-            return collection_id
+            return hub_identifier
 
-        for item in active_block.items:
-            collection = collection_map.get(item.collection_id)
+        for merged_item in merged_items:
+            collection = collection_map.get(merged_item.hub_identifier)
             hub_id = None
             hub = None
 
-            # Method 1: Direct match - collection_id might BE the hub_identifier
-            for h in current_state.hubs:
-                if h.hub_identifier == item.collection_id:
-                    hub_id = h.hub_identifier
-                    hub = h
-                    break
+            # Method 1: Direct match - hub_identifier might BE in current_hubs
+            if merged_item.hub_identifier in current_hubs_by_id:
+                hub_id = merged_item.hub_identifier
+                hub = current_hubs_by_id[hub_id]
 
             # Method 2: Find hub by collection ID in hub_key
             if not hub_id:
                 for h in current_state.hubs:
-                    if f"collections/{item.collection_id}" in h.hub_key:
+                    if f"collections/{merged_item.hub_identifier}" in h.hub_key:
                         hub_id = h.hub_identifier
                         hub = h
                         break
@@ -958,86 +1265,86 @@ async def apply_changes(section_id: str):
 
             # If hub not found and ANY visibility flag is ON, attempt first-time promotion
             if not hub_id:
-                needs_promotion = item.visible_home or item.visible_shared_home or item.visible_shared_friends
-                title = collection.title if collection else item.collection_id
+                needs_promotion = merged_item.visible_home or merged_item.visible_shared_home or merged_item.visible_shared_friends
+                title = collection.title if collection else merged_item.hub_identifier
 
                 if needs_promotion:
                     # Extract ratingKey for the POST call
-                    rating_key = extract_rating_key(item.collection_id)
+                    rating_key = extract_rating_key(merged_item.hub_identifier)
 
                     # Skip non-collection items (built-in hubs like tv.recentlyadded)
                     if not rating_key.isdigit():
-                        logger.info(f"Skipping non-collection hub {item.collection_id} - cannot create")
+                        logger.info(f"Skipping non-collection hub {merged_item.hub_identifier} - cannot create")
                         continue
 
-                    logger.info(f"Attempting first-time promotion for collection '{title}' (ratingKey={rating_key})")
+                    logger.info(f"Attempting first-time promotion for '{title}' (ratingKey={rating_key}) from {merged_item.source}")
 
                     # Attempt to create the hub
                     success, error_msg, created_hub_id = await plex_client.create_hub(
                         section_id,
                         rating_key,
-                        item.visible_home,
-                        item.visible_shared_home,
-                        item.visible_shared_friends,
+                        merged_item.visible_home,
+                        merged_item.visible_shared_home,
+                        merged_item.visible_shared_friends,
                     )
 
                     if success and created_hub_id:
                         logger.info(f"Successfully created hub {created_hub_id} for '{title}'")
                         hubs_created.append({
-                            "collection_id": item.collection_id,
-                            "hub_identifier": created_hub_id,
+                            "hub_identifier": merged_item.hub_identifier,
+                            "created_hub_id": created_hub_id,
                             "title": title,
+                            "source": merged_item.source,
+                            "source_name": merged_item.source_name,
                         })
                         hub_id = created_hub_id
-                        # Re-fetch the hub object for visibility comparison
-                        # (visibility was already set during creation, so no change needed)
                         hub = None  # Will skip visibility change check since we just set it
                     else:
                         logger.error(f"Failed to create hub for '{title}': {error_msg}")
                         hubs_creation_failed.append({
-                            "collection_id": item.collection_id,
+                            "hub_identifier": merged_item.hub_identifier,
                             "title": title,
                             "error": error_msg,
+                            "source": merged_item.source,
+                            "source_name": merged_item.source_name,
                         })
                         unmanaged_collections.append({
-                            "collection_id": item.collection_id,
+                            "hub_identifier": merged_item.hub_identifier,
                             "title": title,
-                            "reason": f"First-time promotion failed: {error_msg}"
+                            "reason": f"First-time promotion failed: {error_msg}",
+                            "source": merged_item.source,
+                            "source_name": merged_item.source_name,
                         })
-                        continue  # Skip this item
+                        continue
                 else:
-                    # Collection not in managed hubs and no visibility requested
-                    # This is fine - nothing to do
-                    logger.debug(f"Collection '{title}' not in managed hubs and no visibility requested - skipping")
+                    logger.debug(f"Item '{merged_item.hub_identifier}' not in managed hubs and no visibility requested - skipping")
                     continue
 
             if hub_id:
                 # Only add to order if visible_home is true
-                # promotedToOwnHome controls whether item appears on YOUR home (the promoted order)
-                if item.visible_home:
+                if merged_item.visible_home:
                     desired_hub_order.append(hub_id)
                     desired_promoted_hubs.add(hub_id)
 
                 # Check if any visibility flag needs to change
-                # Compare individual flags against Plex's actual flags
                 if hub:
-                    # Check if visibility flags need to change
-                    # Mapping: visible_home -> promotedToOwnHome, visible_shared_home -> promotedToSharedHome
                     needs_change = (
-                        hub.promoted_to_own_home != item.visible_home or
-                        hub.promoted_to_shared_home != item.visible_shared_home or
-                        hub.promoted_to_recommended != item.visible_shared_friends
+                        hub.promoted_to_own_home != merged_item.visible_home or
+                        hub.promoted_to_shared_home != merged_item.visible_shared_home or
+                        hub.promoted_to_recommended != merged_item.visible_shared_friends
                     )
                     if needs_change:
                         hub_visibility_changes.append({
                             "hub_id": hub_id,
                             "title": hub.title,
-                            "visible_home": item.visible_home,
-                            "visible_shared_home": item.visible_shared_home,
-                            "visible_shared_friends": item.visible_shared_friends,
+                            "visible_home": merged_item.visible_home,
+                            "visible_shared_home": merged_item.visible_shared_home,
+                            "visible_shared_friends": merged_item.visible_shared_friends,
+                            "source": merged_item.source,
+                            "source_name": merged_item.source_name,
                         })
 
-        # Find hubs that should be hidden (currently promoted but not in block)
+        # Find hubs that should be hidden (currently promoted but not in merged layout)
         for hub in current_state.hubs:
             if hub.promoted and hub.hub_identifier not in desired_promoted_hubs:
                 hub_visibility_changes.append({
@@ -1046,9 +1353,11 @@ async def apply_changes(section_id: str):
                     "visible_home": False,
                     "visible_shared_home": False,
                     "visible_shared_friends": False,
+                    "source": "auto",
+                    "source_name": "Not in active layout",
                 })
 
-        # Apply visibility changes with correct Plex parameters and verification
+        # Apply visibility changes
         for change in hub_visibility_changes:
             success, error_msg = await plex_client.set_hub_visibility(
                 section_id,
@@ -1089,15 +1398,16 @@ async def apply_changes(section_id: str):
         if unmanaged_collections:
             for uc in unmanaged_collections:
                 result.warnings.append(
-                    f"Collection '{uc['title']}' could not be managed: {uc['reason']}"
+                    f"Item '{uc['title']}' from {uc['source']} '{uc['source_name']}' could not be managed: {uc['reason']}"
                 )
 
         return {
             "success": result.success,
             "timestamp": result.timestamp.isoformat(),
             "library_section_id": result.library_section_id,
-            "active_block_id": active_block.id,
-            "active_block_name": active_block.name,
+            "active_block_id": active_block.id if active_block else None,
+            "active_block_name": active_block.name if active_block else None,
+            "active_promotions": [{"id": p.id, "name": p.name, "repeat_yearly": p.repeat_yearly} for p in active_promotions],
             # Hub creation results (first-time promotion)
             "hubs_created": len(hubs_created),
             "hubs_creation_failed": len(hubs_creation_failed),
@@ -1283,8 +1593,8 @@ async def apply_if_needed_internal(section_id: str) -> ApplyIfNeededResult:
     Internal function to check if Plex needs to be synced and apply changes if needed.
 
     This is idempotent and safe to call repeatedly. It:
-    1. Finds active block for current time
-    2. If no active block -> returns NO_ACTIVE_BLOCK (do nothing)
+    1. Gets merged layout (promotions + block) for current time
+    2. If no active block AND no promotions -> returns NO_ACTIVE_BLOCK (do nothing)
     3. Computes diff vs current Plex state
     4. If no diff -> returns IN_SYNC
     5. If diff exists -> applies changes, returns APPLIED
@@ -1295,25 +1605,27 @@ async def apply_if_needed_internal(section_id: str) -> ApplyIfNeededResult:
     now = datetime.now()
 
     try:
-        # Find active layout block
-        active_block = await get_active_layout_block(section_id, now)
+        # Get merged layout (promotions + block)
+        merged_items, active_promotions, active_block = await get_merged_layout(
+            section_id, now
+        )
 
-        if not active_block:
-            # No active block - this is fine, just don't do anything
+        # Check for dead time (no block AND no promotions)
+        if not active_block and not active_promotions:
             return ApplyIfNeededResult(
                 status=SyncResultStatus.NO_ACTIVE_BLOCK,
                 library_section_id=section_id,
                 checked_at=now,
             )
 
-        if not active_block.items:
-            # Block has no items - treat as no changes needed
+        if not merged_items:
+            # Has block/promotions but no items - treat as in sync
             return ApplyIfNeededResult(
                 status=SyncResultStatus.IN_SYNC,
                 library_section_id=section_id,
                 checked_at=now,
-                active_block_id=active_block.id,
-                active_block_name=active_block.name,
+                active_block_id=active_block.id if active_block else None,
+                active_block_name=active_block.name if active_block else None,
             )
 
         # Get current Plex state
@@ -1333,25 +1645,25 @@ async def apply_if_needed_internal(section_id: str) -> ApplyIfNeededResult:
         desired_promoted_hubs = set()
 
         # Helper to extract ratingKey
-        def extract_rating_key(collection_id: str) -> str:
-            if '.' in collection_id:
-                return collection_id.split('.')[-1]
-            return collection_id
+        def extract_rating_key(hub_identifier: str) -> str:
+            if '.' in hub_identifier:
+                return hub_identifier.split('.')[-1]
+            return hub_identifier
 
-        # Process each block item
-        for item in active_block.items:
-            collection = collection_map.get(item.collection_id)
+        # Process each merged item
+        for merged_item in merged_items:
+            collection = collection_map.get(merged_item.hub_identifier)
             hub_id = None
             hub = None
 
-            # Find hub by collection_id (direct match)
-            if item.collection_id in current_hubs_by_id:
-                hub_id = item.collection_id
-                hub = current_hubs_by_id[item.collection_id]
+            # Find hub by hub_identifier (direct match)
+            if merged_item.hub_identifier in current_hubs_by_id:
+                hub_id = merged_item.hub_identifier
+                hub = current_hubs_by_id[merged_item.hub_identifier]
             # Find hub by hub_key
             if not hub_id:
                 for h in current_state.hubs:
-                    if f"collections/{item.collection_id}" in h.hub_key:
+                    if f"collections/{merged_item.hub_identifier}" in h.hub_key:
                         hub_id = h.hub_identifier
                         hub = h
                         break
@@ -1363,40 +1675,40 @@ async def apply_if_needed_internal(section_id: str) -> ApplyIfNeededResult:
 
             if not hub_id:
                 # Hub not in managed list - may need first-time promotion
-                needs_promotion = item.visible_home or item.visible_shared_home or item.visible_shared_friends
+                needs_promotion = merged_item.visible_home or merged_item.visible_shared_home or merged_item.visible_shared_friends
                 if needs_promotion:
-                    rating_key = extract_rating_key(item.collection_id)
+                    rating_key = extract_rating_key(merged_item.hub_identifier)
                     if rating_key.isdigit():
                         visibility_changes_needed.append({
                             "type": "create",
-                            "collection_id": item.collection_id,
+                            "hub_identifier": merged_item.hub_identifier,
                             "rating_key": rating_key,
-                            "visible_home": item.visible_home,
-                            "visible_shared_home": item.visible_shared_home,
-                            "visible_shared_friends": item.visible_shared_friends,
+                            "visible_home": merged_item.visible_home,
+                            "visible_shared_home": merged_item.visible_shared_home,
+                            "visible_shared_friends": merged_item.visible_shared_friends,
                         })
                 continue
 
             # Track desired order
-            if item.visible_home:
+            if merged_item.visible_home:
                 desired_hub_order.append(hub_id)
                 desired_promoted_hubs.add(hub_id)
 
             # Check visibility changes
             if hub:
                 needs_vis_change = (
-                    hub.promoted_to_own_home != item.visible_home or
-                    hub.promoted_to_shared_home != item.visible_shared_home or
-                    hub.promoted_to_recommended != item.visible_shared_friends
+                    hub.promoted_to_own_home != merged_item.visible_home or
+                    hub.promoted_to_shared_home != merged_item.visible_shared_home or
+                    hub.promoted_to_recommended != merged_item.visible_shared_friends
                 )
                 if needs_vis_change:
                     visibility_changes_needed.append({
                         "type": "update",
                         "hub_id": hub_id,
                         "title": hub.title,
-                        "visible_home": item.visible_home,
-                        "visible_shared_home": item.visible_shared_home,
-                        "visible_shared_friends": item.visible_shared_friends,
+                        "visible_home": merged_item.visible_home,
+                        "visible_shared_home": merged_item.visible_shared_home,
+                        "visible_shared_friends": merged_item.visible_shared_friends,
                     })
 
         # Check for hubs that need to be hidden
@@ -1421,9 +1733,17 @@ async def apply_if_needed_internal(section_id: str) -> ApplyIfNeededResult:
                 status=SyncResultStatus.IN_SYNC,
                 library_section_id=section_id,
                 checked_at=now,
-                active_block_id=active_block.id,
-                active_block_name=active_block.name,
+                active_block_id=active_block.id if active_block else None,
+                active_block_name=active_block.name if active_block else None,
             )
+
+        # Build snapshot note
+        snapshot_note_parts = []
+        if active_block:
+            snapshot_note_parts.append(f"block '{active_block.name}'")
+        if active_promotions:
+            promo_names = [p.name for p in active_promotions]
+            snapshot_note_parts.append(f"promotions [{', '.join(promo_names)}]")
 
         # Changes needed - apply them
         logger.info(f"Sync needed for library {section_id}: {len(visibility_changes_needed)} visibility changes, order_changed={order_changed}")
@@ -1442,7 +1762,7 @@ async def apply_if_needed_internal(section_id: str) -> ApplyIfNeededResult:
                 }
                 for h in current_state.hubs
             },
-            note=f"Auto-sync snapshot for block '{active_block.name}' at {now.isoformat()}",
+            note=f"Auto-sync snapshot for {' + '.join(snapshot_note_parts)} at {now.isoformat()}",
         )
         await db.save_rollback_snapshot(rollback)
 
@@ -1484,8 +1804,8 @@ async def apply_if_needed_internal(section_id: str) -> ApplyIfNeededResult:
             status=SyncResultStatus.APPLIED,
             library_section_id=section_id,
             checked_at=now,
-            active_block_id=active_block.id,
-            active_block_name=active_block.name,
+            active_block_id=active_block.id if active_block else None,
+            active_block_name=active_block.name if active_block else None,
             changes_applied=visibility_applied + order_applied,
             visibility_changes=visibility_applied,
             order_changes=order_applied,
@@ -1785,6 +2105,7 @@ async def list_layout_blocks(section_id: str):
                     "name": b.name,
                     "start_at": b.start_at.isoformat(),
                     "end_at": b.end_at.isoformat(),
+                    "repeat_yearly": b.repeat_yearly,
                     "created_at": b.created_at.isoformat() if b.created_at else None,
                     "updated_at": b.updated_at.isoformat() if b.updated_at else None,
                     "items_count": len(b.items),
@@ -1808,6 +2129,7 @@ async def create_layout_block_endpoint(section_id: str, data: LayoutBlockCreate)
             name=data.name,
             start_at=data.start_at,
             end_at=data.end_at,
+            repeat_yearly=data.repeat_yearly,
         )
         return {
             "id": block.id,
@@ -1815,6 +2137,7 @@ async def create_layout_block_endpoint(section_id: str, data: LayoutBlockCreate)
             "name": block.name,
             "start_at": block.start_at.isoformat(),
             "end_at": block.end_at.isoformat(),
+            "repeat_yearly": block.repeat_yearly,
             "created_at": block.created_at.isoformat() if block.created_at else None,
             "updated_at": block.updated_at.isoformat() if block.updated_at else None,
             "message": "Layout block created",
@@ -1837,6 +2160,7 @@ async def get_layout_block_endpoint(block_id: str):
             "name": block.name,
             "start_at": block.start_at.isoformat(),
             "end_at": block.end_at.isoformat(),
+            "repeat_yearly": block.repeat_yearly,
             "created_at": block.created_at.isoformat() if block.created_at else None,
             "updated_at": block.updated_at.isoformat() if block.updated_at else None,
             "items": [
@@ -1870,6 +2194,7 @@ async def update_layout_block_endpoint(block_id: str, data: LayoutBlockUpdate):
             name=data.name,
             start_at=data.start_at,
             end_at=data.end_at,
+            repeat_yearly=data.repeat_yearly,
         )
         if not block:
             raise HTTPException(status_code=404, detail="Layout block not found")
@@ -1879,6 +2204,7 @@ async def update_layout_block_endpoint(block_id: str, data: LayoutBlockUpdate):
             "name": block.name,
             "start_at": block.start_at.isoformat(),
             "end_at": block.end_at.isoformat(),
+            "repeat_yearly": block.repeat_yearly,
             "created_at": block.created_at.isoformat() if block.created_at else None,
             "updated_at": block.updated_at.isoformat() if block.updated_at else None,
             "message": "Layout block updated",
@@ -1903,6 +2229,441 @@ async def delete_layout_block_endpoint(block_id: str):
         raise
     except Exception as e:
         logger.error(f"Failed to delete layout block: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class LayoutBlockDuplicate(BaseModel):
+    """Request body for duplicating a layout block."""
+    name: Optional[str] = None  # If not provided, will use "{original_name} (Copy)"
+    shift_years: int = 1  # How many years to shift dates forward
+
+
+@app.post("/api/layout-blocks/{block_id}/duplicate")
+async def duplicate_layout_block_endpoint(block_id: str, data: Optional[LayoutBlockDuplicate] = None):
+    """
+    Duplicate a layout block with all its items.
+
+    Creates a copy of the block with dates shifted forward by the specified years.
+    All items (collection order and visibility) are copied to the new block.
+    """
+    try:
+        existing = await get_layout_block(block_id)
+        if not existing:
+            raise HTTPException(status_code=404, detail="Layout block not found")
+
+        # Determine new name
+        new_name = existing.name + " (Copy)"
+        shift_years = 1
+        if data:
+            if data.name:
+                new_name = data.name
+            shift_years = data.shift_years
+
+        # Duplicate the block
+        new_block = await duplicate_layout_block(
+            source_block_id=block_id,
+            new_name=new_name,
+            shift_years=shift_years
+        )
+
+        if not new_block:
+            raise HTTPException(status_code=500, detail="Failed to duplicate block")
+
+        # Get items for the new block
+        items = await get_layout_block_items(new_block.id)
+
+        return {
+            "id": new_block.id,
+            "library_section_id": new_block.library_section_id,
+            "name": new_block.name,
+            "start_at": new_block.start_at.isoformat(),
+            "end_at": new_block.end_at.isoformat(),
+            "created_at": new_block.created_at.isoformat() if new_block.created_at else None,
+            "updated_at": new_block.updated_at.isoformat() if new_block.updated_at else None,
+            "items_count": len(items),
+            "message": f"Block duplicated with {len(items)} items"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to duplicate layout block: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ================== Save/Load Layout Templates ==================
+
+class SaveLayoutRequest(BaseModel):
+    """Request to save a layout as a reusable template."""
+    name: str
+    description: Optional[str] = None
+
+
+class LoadLayoutRequest(BaseModel):
+    """Request to load a saved layout as a new scheduled layout."""
+    name: str
+    start_at: str
+    end_at: str
+    repeat_yearly: bool = False
+
+
+class LayoutExport(BaseModel):
+    """Exported layout block format."""
+    version: int = 1
+    exported_at: str
+    layout: dict
+
+
+class LayoutImport(BaseModel):
+    """Import request for layout block."""
+    version: int
+    exported_at: Optional[str] = None
+    layout: dict
+
+
+@app.get("/api/layout-blocks/{block_id}/export")
+async def export_layout_block(block_id: str):
+    """
+    Export a layout block as JSON for backup or sharing.
+
+    Returns a JSON structure that can be imported later.
+    Includes all items with their visibility settings.
+    """
+    try:
+        existing = await get_layout_block(block_id)
+        if not existing:
+            raise HTTPException(status_code=404, detail="Layout block not found")
+
+        items = await get_layout_block_items(block_id)
+
+        # Get hub titles for better readability in export
+        hub_titles = {}
+        try:
+            state = await plex_client.get_managed_hubs(existing.library_section_id)
+            for hub in state.hubs:
+                hub_titles[hub.hub_identifier] = hub.title
+        except Exception as e:
+            logger.warning(f"Could not fetch hub titles for export: {e}")
+
+        export_data = {
+            "version": 1,
+            "exported_at": datetime.utcnow().isoformat() + "Z",
+            "layout": {
+                "name": existing.name,
+                "start_at": existing.start_at.isoformat(),
+                "end_at": existing.end_at.isoformat(),
+                "repeat_yearly": existing.repeat_yearly if hasattr(existing, 'repeat_yearly') else False,
+                "items": [
+                    {
+                        "hub_identifier": item.collection_id,
+                        "collection_title": hub_titles.get(item.collection_id, "Unknown"),
+                        "order_index": item.order_index,
+                        "visible_home": item.visible_home,
+                        "visible_shared_home": item.visible_shared_home,
+                        "visible_shared_friends": item.visible_shared_friends,
+                    }
+                    for item in sorted(items, key=lambda x: x.order_index)
+                ]
+            }
+        }
+
+        return export_data
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to export layout block: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/libraries/{section_id}/layout-blocks/import")
+async def import_layout_block(section_id: str, data: LayoutImport):
+    """
+    Import a layout block from exported JSON.
+
+    Creates a new layout block from the exported data.
+    Collections that no longer exist in Plex will be skipped with warnings.
+    """
+    try:
+        layout = data.layout
+
+        # Validate required fields
+        if not layout.get("name"):
+            raise HTTPException(status_code=400, detail="Layout name is required")
+        if not layout.get("start_at") or not layout.get("end_at"):
+            raise HTTPException(status_code=400, detail="Start and end dates are required")
+
+        # Get current hubs to validate collections
+        available_hubs = set()
+        hub_titles = {}
+        try:
+            state = await plex_client.get_managed_hubs(section_id)
+            for hub in state.hubs:
+                available_hubs.add(hub.hub_identifier)
+                hub_titles[hub.hub_identifier] = hub.title
+        except Exception as e:
+            logger.warning(f"Could not fetch hubs for validation: {e}")
+
+        # Filter items - keep only those that exist in Plex
+        items = layout.get("items", [])
+        valid_items = []
+        skipped_items = []
+
+        for item in items:
+            hub_id = item.get("hub_identifier")
+            if hub_id in available_hubs:
+                valid_items.append(item)
+            else:
+                # Collection not found - skip with warning
+                title = item.get("collection_title", hub_id)
+                skipped_items.append(title)
+
+        # Create the layout block
+        block_id = str(uuid.uuid4())
+        # Parse dates, handling various ISO formats
+        start_at_str = layout["start_at"].replace("Z", "+00:00")
+        end_at_str = layout["end_at"].replace("Z", "+00:00")
+        # Handle case where there's no timezone info
+        if "+" not in start_at_str and "-" not in start_at_str[10:]:
+            start_at = datetime.fromisoformat(start_at_str)
+        else:
+            start_at = datetime.fromisoformat(start_at_str)
+        if "+" not in end_at_str and "-" not in end_at_str[10:]:
+            end_at = datetime.fromisoformat(end_at_str)
+        else:
+            end_at = datetime.fromisoformat(end_at_str)
+
+        new_block = await create_layout_block(
+            block_id=block_id,
+            library_section_id=section_id,
+            name=layout["name"] + " (Imported)",
+            start_at=start_at,
+            end_at=end_at,
+            repeat_yearly=layout.get("repeat_yearly", False)
+        )
+
+        # Add valid items to the block
+        if valid_items:
+            items_to_save = [
+                {
+                    "collection_id": item["hub_identifier"],
+                    "order_index": item.get("order_index", idx),
+                    "visible_home": item.get("visible_home", True),
+                    "visible_shared_home": item.get("visible_shared_home", True),
+                    "visible_shared_friends": item.get("visible_shared_friends", True),
+                }
+                for idx, item in enumerate(valid_items)
+            ]
+            await save_layout_block_items(new_block.id, items_to_save)
+
+        return {
+            "success": True,
+            "block_id": new_block.id,
+            "name": new_block.name,
+            "items_imported": len(valid_items),
+            "items_skipped": len(skipped_items),
+            "skipped_collections": skipped_items,
+            "message": f"Imported {len(valid_items)} collections" +
+                      (f", skipped {len(skipped_items)} not found in Plex" if skipped_items else "")
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to import layout block: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ================== Saved Layouts Endpoints ==================
+
+@app.get("/api/libraries/{section_id}/saved-layouts")
+async def list_saved_layouts(section_id: str):
+    """List all saved layouts for a library."""
+    try:
+        layouts = await get_saved_layouts(section_id)
+        return {"saved_layouts": layouts}
+    except Exception as e:
+        logger.error(f"Failed to list saved layouts: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/layout-blocks/{block_id}/save")
+async def save_layout_as_template(block_id: str, request: SaveLayoutRequest):
+    """
+    Save a layout block as a reusable template.
+
+    The layout's items and visibility settings are saved but not the schedule dates.
+    """
+    try:
+        existing = await get_layout_block(block_id)
+        if not existing:
+            raise HTTPException(status_code=404, detail="Layout block not found")
+
+        items = await get_layout_block_items(block_id)
+
+        # Get hub titles for better readability
+        hub_titles = {}
+        try:
+            state = await plex_client.get_managed_hubs(existing.library_section_id)
+            for hub in state.hubs:
+                hub_titles[hub.hub_identifier] = hub.title
+        except Exception as e:
+            logger.warning(f"Could not fetch hub titles: {e}")
+
+        # Create layout data structure (similar to export but without dates)
+        layout_data = {
+            "items": [
+                {
+                    "hub_identifier": item.collection_id,
+                    "collection_title": hub_titles.get(item.collection_id, "Unknown"),
+                    "order_index": item.order_index,
+                    "visible_home": item.visible_home,
+                    "visible_shared_home": item.visible_shared_home,
+                    "visible_shared_friends": item.visible_shared_friends,
+                }
+                for item in sorted(items, key=lambda x: x.order_index)
+            ]
+        }
+
+        # Save to database
+        layout_id = str(uuid.uuid4())
+        saved = await create_saved_layout(
+            layout_id=layout_id,
+            library_section_id=existing.library_section_id,
+            name=request.name,
+            layout_data=layout_data,
+            description=request.description
+        )
+
+        return {
+            "success": True,
+            "saved_layout": saved,
+            "message": f"Saved layout '{request.name}' with {len(items)} collections"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to save layout: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/saved-layouts/{layout_id}")
+async def get_saved_layout_endpoint(layout_id: str):
+    """Get a specific saved layout including its data."""
+    try:
+        layout = await get_saved_layout(layout_id)
+        if not layout:
+            raise HTTPException(status_code=404, detail="Saved layout not found")
+        return layout
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get saved layout: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/saved-layouts/{layout_id}")
+async def delete_saved_layout_endpoint(layout_id: str):
+    """Delete a saved layout."""
+    try:
+        deleted = await delete_saved_layout(layout_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Saved layout not found")
+        return {"success": True, "message": "Saved layout deleted"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to delete saved layout: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/libraries/{section_id}/saved-layouts/{layout_id}/load")
+async def load_saved_layout(section_id: str, layout_id: str, request: LoadLayoutRequest):
+    """
+    Load a saved layout as a new scheduled layout block.
+
+    Creates a new layout block from the saved template with the specified schedule.
+    Collections that no longer exist in Plex will be skipped.
+    """
+    try:
+        saved = await get_saved_layout(layout_id)
+        if not saved:
+            raise HTTPException(status_code=404, detail="Saved layout not found")
+
+        layout_data = saved["layout_data"]
+
+        # Get current hubs to validate collections
+        available_hubs = set()
+        hub_titles = {}
+        try:
+            state = await plex_client.get_managed_hubs(section_id)
+            for hub in state.hubs:
+                available_hubs.add(hub.hub_identifier)
+                hub_titles[hub.hub_identifier] = hub.title
+        except Exception as e:
+            logger.warning(f"Could not fetch hubs for validation: {e}")
+
+        # Filter items - keep only those that exist in Plex
+        items = layout_data.get("items", [])
+        valid_items = []
+        skipped_items = []
+
+        for item in items:
+            hub_id = item.get("hub_identifier")
+            if hub_id in available_hubs:
+                valid_items.append(item)
+            else:
+                title = item.get("collection_title", hub_id)
+                skipped_items.append(title)
+
+        # Parse dates
+        start_at_str = request.start_at.replace("Z", "+00:00")
+        end_at_str = request.end_at.replace("Z", "+00:00")
+        if "+" not in start_at_str and "-" not in start_at_str[10:]:
+            start_at = datetime.fromisoformat(start_at_str)
+        else:
+            start_at = datetime.fromisoformat(start_at_str)
+        if "+" not in end_at_str and "-" not in end_at_str[10:]:
+            end_at = datetime.fromisoformat(end_at_str)
+        else:
+            end_at = datetime.fromisoformat(end_at_str)
+
+        # Create the new layout block
+        block_id = str(uuid.uuid4())
+        new_block = await create_layout_block(
+            block_id=block_id,
+            library_section_id=section_id,
+            name=request.name,
+            start_at=start_at,
+            end_at=end_at,
+            repeat_yearly=request.repeat_yearly
+        )
+
+        # Add valid items to the block
+        if valid_items:
+            items_to_save = [
+                {
+                    "collection_id": item["hub_identifier"],
+                    "order_index": item.get("order_index", idx),
+                    "visible_home": item.get("visible_home", True),
+                    "visible_shared_home": item.get("visible_shared_home", True),
+                    "visible_shared_friends": item.get("visible_shared_friends", True),
+                }
+                for idx, item in enumerate(valid_items)
+            ]
+            await save_layout_block_items(new_block.id, items_to_save)
+
+        return {
+            "success": True,
+            "block_id": new_block.id,
+            "name": new_block.name,
+            "items_loaded": len(valid_items),
+            "items_skipped": len(skipped_items),
+            "skipped_collections": skipped_items,
+            "message": f"Created layout '{request.name}' with {len(valid_items)} collections" +
+                      (f", skipped {len(skipped_items)} not found in Plex" if skipped_items else "")
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to load saved layout: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -2015,6 +2776,270 @@ async def save_layout_block_items_endpoint(block_id: str, data: LayoutBlockItems
         raise
     except Exception as e:
         logger.error(f"Failed to save layout block items: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ================== Promotions ==================
+
+class PromotionItemsUpdate(BaseModel):
+    """Request body for bulk updating promotion items."""
+    items: list[PromotionItemSave]
+
+
+@app.get("/api/libraries/{section_id}/promotions")
+async def list_promotions(section_id: str):
+    """List all promotions for a library."""
+    try:
+        promotions = await get_promotions(section_id)
+        return {
+            "promotions": [
+                {
+                    "id": p.id,
+                    "library_section_id": p.library_section_id,
+                    "name": p.name,
+                    "start_at": p.start_at.isoformat(),
+                    "end_at": p.end_at.isoformat(),
+                    "repeat_yearly": p.repeat_yearly,
+                    "items_count": len(p.items),
+                    "created_at": p.created_at.isoformat() if p.created_at else None,
+                    "updated_at": p.updated_at.isoformat() if p.updated_at else None,
+                }
+                for p in promotions
+            ]
+        }
+    except Exception as e:
+        logger.error(f"Failed to list promotions: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/libraries/{section_id}/promotions")
+async def create_promotion_endpoint(section_id: str, data: PromotionCreate):
+    """Create a new promotion."""
+    try:
+        promotion_id = str(uuid.uuid4())
+        promotion = await create_promotion(
+            promotion_id=promotion_id,
+            library_section_id=section_id,
+            name=data.name,
+            start_at=data.start_at,
+            end_at=data.end_at,
+            repeat_yearly=data.repeat_yearly,
+        )
+        return {
+            "id": promotion.id,
+            "library_section_id": promotion.library_section_id,
+            "name": promotion.name,
+            "start_at": promotion.start_at.isoformat(),
+            "end_at": promotion.end_at.isoformat(),
+            "repeat_yearly": promotion.repeat_yearly,
+            "items_count": 0,
+            "created_at": promotion.created_at.isoformat() if promotion.created_at else None,
+            "updated_at": promotion.updated_at.isoformat() if promotion.updated_at else None,
+        }
+    except Exception as e:
+        logger.error(f"Failed to create promotion: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/promotions/{promotion_id}")
+async def get_promotion_endpoint(promotion_id: str):
+    """Get a promotion by ID."""
+    try:
+        promotion = await get_promotion(promotion_id)
+        if not promotion:
+            raise HTTPException(status_code=404, detail="Promotion not found")
+
+        return {
+            "id": promotion.id,
+            "library_section_id": promotion.library_section_id,
+            "name": promotion.name,
+            "start_at": promotion.start_at.isoformat(),
+            "end_at": promotion.end_at.isoformat(),
+            "repeat_yearly": promotion.repeat_yearly,
+            "items": [
+                {
+                    "id": item.id,
+                    "promotion_id": item.promotion_id,
+                    "hub_identifier": item.hub_identifier,
+                    "order_index": item.order_index,
+                    "visible_home": item.visible_home,
+                    "visible_shared_home": item.visible_shared_home,
+                    "visible_shared_friends": item.visible_shared_friends,
+                }
+                for item in promotion.items
+            ],
+            "items_count": len(promotion.items),
+            "created_at": promotion.created_at.isoformat() if promotion.created_at else None,
+            "updated_at": promotion.updated_at.isoformat() if promotion.updated_at else None,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get promotion: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/api/promotions/{promotion_id}")
+async def update_promotion_endpoint(promotion_id: str, data: PromotionUpdate):
+    """Update a promotion's metadata."""
+    try:
+        promotion = await update_promotion(
+            promotion_id=promotion_id,
+            name=data.name,
+            start_at=data.start_at,
+            end_at=data.end_at,
+            repeat_yearly=data.repeat_yearly,
+        )
+        if not promotion:
+            raise HTTPException(status_code=404, detail="Promotion not found")
+
+        return {
+            "id": promotion.id,
+            "library_section_id": promotion.library_section_id,
+            "name": promotion.name,
+            "start_at": promotion.start_at.isoformat(),
+            "end_at": promotion.end_at.isoformat(),
+            "repeat_yearly": promotion.repeat_yearly,
+            "items_count": len(promotion.items),
+            "created_at": promotion.created_at.isoformat() if promotion.created_at else None,
+            "updated_at": promotion.updated_at.isoformat() if promotion.updated_at else None,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to update promotion: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/promotions/{promotion_id}")
+async def delete_promotion_endpoint(promotion_id: str):
+    """Delete a promotion and its items."""
+    try:
+        existing = await get_promotion(promotion_id)
+        if not existing:
+            raise HTTPException(status_code=404, detail="Promotion not found")
+        await delete_promotion(promotion_id)
+        return {"message": "Promotion deleted"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to delete promotion: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/promotions/{promotion_id}/items")
+async def get_promotion_items_endpoint(promotion_id: str):
+    """Get all items for a promotion."""
+    try:
+        existing = await get_promotion(promotion_id)
+        if not existing:
+            raise HTTPException(status_code=404, detail="Promotion not found")
+        items = await get_promotion_items(promotion_id)
+        return {
+            "items": [
+                {
+                    "id": item.id,
+                    "promotion_id": item.promotion_id,
+                    "hub_identifier": item.hub_identifier,
+                    "order_index": item.order_index,
+                    "visible_home": item.visible_home,
+                    "visible_shared_home": item.visible_shared_home,
+                    "visible_shared_friends": item.visible_shared_friends,
+                    "created_at": item.created_at.isoformat() if item.created_at else None,
+                    "updated_at": item.updated_at.isoformat() if item.updated_at else None,
+                }
+                for item in items
+            ]
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get promotion items: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/api/promotions/{promotion_id}/items")
+async def save_promotion_items_endpoint(promotion_id: str, data: PromotionItemsUpdate):
+    """Bulk save items for a promotion (replaces all existing items)."""
+    try:
+        existing = await get_promotion(promotion_id)
+        if not existing:
+            raise HTTPException(status_code=404, detail="Promotion not found")
+
+        # Convert Pydantic models to dicts
+        items_data = [
+            {
+                "hub_identifier": item.hub_identifier,
+                "order_index": item.order_index,
+                "visible_home": item.visible_home,
+                "visible_shared_home": item.visible_shared_home,
+                "visible_shared_friends": item.visible_shared_friends,
+            }
+            for item in data.items
+        ]
+
+        logger.info(f"Saving {len(items_data)} items to promotion {promotion_id}")
+        await save_promotion_items(promotion_id, items_data)
+
+        # Return the updated items
+        items = await get_promotion_items(promotion_id)
+        return {
+            "message": "Promotion items saved",
+            "items_count": len(items),
+            "items": [
+                {
+                    "id": item.id,
+                    "promotion_id": item.promotion_id,
+                    "hub_identifier": item.hub_identifier,
+                    "order_index": item.order_index,
+                    "visible_home": item.visible_home,
+                    "visible_shared_home": item.visible_shared_home,
+                    "visible_shared_friends": item.visible_shared_friends,
+                    "created_at": item.created_at.isoformat() if item.created_at else None,
+                    "updated_at": item.updated_at.isoformat() if item.updated_at else None,
+                }
+                for item in items
+            ]
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to save promotion items: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/libraries/{section_id}/active-promotions")
+async def get_active_promotions_endpoint(section_id: str, at: Optional[str] = None):
+    """Get all active promotions at a given time (or now)."""
+    try:
+        target_time = datetime.fromisoformat(at) if at else datetime.now()
+        promotions = await get_active_promotions(section_id, target_time)
+        return {
+            "at": target_time.isoformat(),
+            "promotions": [
+                {
+                    "id": p.id,
+                    "name": p.name,
+                    "start_at": p.start_at.isoformat(),
+                    "end_at": p.end_at.isoformat(),
+                    "repeat_yearly": p.repeat_yearly,
+                    "items_count": len(p.items),
+                    "items": [
+                        {
+                            "hub_identifier": item.hub_identifier,
+                            "order_index": item.order_index,
+                            "visible_home": item.visible_home,
+                            "visible_shared_home": item.visible_shared_home,
+                            "visible_shared_friends": item.visible_shared_friends,
+                        }
+                        for item in p.items
+                    ]
+                }
+                for p in promotions
+            ]
+        }
+    except Exception as e:
+        logger.error(f"Failed to get active promotions: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

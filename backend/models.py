@@ -282,6 +282,7 @@ class LayoutBlock(BaseModel):
     name: str
     start_at: datetime
     end_at: datetime
+    repeat_yearly: bool = False
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
     items: list[LayoutBlockItem] = Field(default_factory=list)
@@ -292,6 +293,7 @@ class LayoutBlockCreate(BaseModel):
     name: str
     start_at: datetime
     end_at: datetime
+    repeat_yearly: bool = False
 
 
 class LayoutBlockUpdate(BaseModel):
@@ -299,6 +301,7 @@ class LayoutBlockUpdate(BaseModel):
     name: Optional[str] = None
     start_at: Optional[datetime] = None
     end_at: Optional[datetime] = None
+    repeat_yearly: Optional[bool] = None
 
 
 class LayoutBlockItemSave(BaseModel):
@@ -351,3 +354,62 @@ class ApplyIfNeededResult(BaseModel):
     order_changes: int = 0
     error_message: Optional[str] = None
     rollback_snapshot_id: Optional[str] = None
+
+
+# ================== Promotion Models ==================
+
+class PromotionItem(BaseModel):
+    """An item within a promotion - a collection to be promoted to the top."""
+    id: Optional[str] = None
+    promotion_id: str
+    hub_identifier: str  # The collection/hub to promote
+    order_index: int  # Position within the promotion (0 = top)
+    visible_home: bool = True  # Default: full visibility
+    visible_shared_home: bool = True
+    visible_shared_friends: bool = True
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class Promotion(BaseModel):
+    """
+    A promotion overlays specific collections at the top of the current layout.
+
+    Unlike Schedules (which replace the entire layout), Promotions merge with
+    whatever is currently active (Base Template or a Schedule) and insert
+    promoted collections at the top.
+    """
+    id: Optional[str] = None
+    library_section_id: str
+    name: str
+    start_at: datetime
+    end_at: datetime
+    repeat_yearly: bool = False  # If True, promotion recurs every year
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    items: list[PromotionItem] = Field(default_factory=list)
+
+
+class PromotionCreate(BaseModel):
+    """Request model for creating a promotion."""
+    name: str
+    start_at: datetime
+    end_at: datetime
+    repeat_yearly: bool = False
+
+
+class PromotionUpdate(BaseModel):
+    """Request model for updating a promotion."""
+    name: Optional[str] = None
+    start_at: Optional[datetime] = None
+    end_at: Optional[datetime] = None
+    repeat_yearly: Optional[bool] = None
+
+
+class PromotionItemSave(BaseModel):
+    """Request model for saving a promotion item."""
+    hub_identifier: str
+    order_index: int
+    visible_home: bool = True
+    visible_shared_home: bool = True
+    visible_shared_friends: bool = True

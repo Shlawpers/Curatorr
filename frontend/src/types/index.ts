@@ -179,6 +179,7 @@ export interface LayoutBlock {
   name: string;
   start_at: string; // ISO datetime
   end_at: string;   // ISO datetime
+  repeat_yearly?: boolean;
   items?: LayoutBlockItem[];
 }
 
@@ -186,12 +187,14 @@ export interface LayoutBlockCreate {
   name: string;
   start_at: string;
   end_at: string;
+  repeat_yearly?: boolean;
 }
 
 export interface LayoutBlockUpdate {
   name?: string;
   start_at?: string;
   end_at?: string;
+  repeat_yearly?: boolean;
 }
 
 // Sync Settings Types
@@ -288,4 +291,52 @@ export interface CollectionScheduleInfo {
   visible_shared?: boolean | string | null;
   visible_library?: boolean | string | null;
   message?: string;
+}
+
+// Promotion Types - Overlays that boost specific collections to the top
+export interface PromotionItem {
+  id: string;
+  promotion_id: string;
+  hub_identifier: string;
+  order_index: number;
+  visible_home: boolean;
+  visible_shared_home: boolean;
+  visible_shared_friends: boolean;
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+export interface Promotion {
+  id: string;
+  library_section_id: string;
+  name: string;
+  start_at: string; // ISO datetime
+  end_at: string;   // ISO datetime
+  repeat_yearly: boolean;
+  items_count: number;
+  items?: PromotionItem[];
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+export interface PromotionCreate {
+  name: string;
+  start_at: string;
+  end_at: string;
+  repeat_yearly: boolean;
+}
+
+export interface PromotionUpdate {
+  name?: string;
+  start_at?: string;
+  end_at?: string;
+  repeat_yearly?: boolean;
+}
+
+export interface PromotionItemSave {
+  hub_identifier: string;
+  order_index: number;
+  visible_home: boolean;
+  visible_shared_home: boolean;
+  visible_shared_friends: boolean;
 }

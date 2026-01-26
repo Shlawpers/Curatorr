@@ -21,6 +21,10 @@ import type {
   RollbackResult,
   BlockConflictsResponse,
   CollectionScheduleInfo,
+  Promotion,
+  PromotionCreate,
+  PromotionUpdate,
+  PromotionItem,
 } from '../types';
 
 const API_BASE = '/api';
@@ -31,6 +35,7 @@ async function fetchApi<T>(endpoint: string, options?: RequestInit): Promise<T> 
       'Content-Type': 'application/json',
       ...options?.headers,
     },
+    credentials: 'include',  // Important for cookies
     ...options,
   });
 
@@ -41,6 +46,67 @@ async function fetchApi<T>(endpoint: string, options?: RequestInit): Promise<T> 
 
   return response.json();
 }
+
+// ================== Authentication ==================
+
+export interface AuthStatus {
+  auth_enabled: boolean;
+  authenticated: boolean;
+}
+
+export function useAuth() {
+  const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const checkAuthStatus = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const data = await fetchApi<AuthStatus>('/auth/status');
+      setAuthStatus(data);
+      return data;
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to check auth status');
+      return null;
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const login = useCallback(async (password: string): Promise<boolean> => {
+    try {
+      await fetchApi<{ success: boolean }>('/auth/login', {
+        method: 'POST',
+        body: JSON.stringify({ password }),
+      });
+      // Refresh auth status after login
+      await checkAuthStatus();
+      return true;
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Login failed');
+      return false;
+    }
+  }, [checkAuthStatus]);
+
+  const logout = useCallback(async (): Promise<boolean> => {
+    try {
+      await fetchApi<{ success: boolean }>('/auth/logout', {
+        method: 'POST',
+      });
+      // Refresh auth status after logout
+      await checkAuthStatus();
+      return true;
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Logout failed');
+      return false;
+    }
+  }, [checkAuthStatus]);
+
+  return { authStatus, loading, error, checkAuthStatus, login, logout };
+}
+
+// ================== Config ==================
 
 export function useConfig() {
   const [config, setConfig] = useState<Config | null>(null);
@@ -578,6 +644,57 @@ export function useLayoutBlocks(sectionId: string | null) {
     }
   }, []);
 
+  const duplicateLayoutBlock = useCallback(async (blockId: string, name?: string, shiftYears: number = 1) => {
+    try {
+      const data = await fetchApi<LayoutBlock & { message: string }>(`/layout-blocks/${blockId}/duplicate`, {
+        method: 'POST',
+        body: JSON.stringify({ name, shift_years: shiftYears }),
+      });
+      await fetchLayoutBlocks();
+      return data;
+    } catch (e) {
+      throw new Error(e instanceof Error ? e.message : 'Failed to duplicate layout block');
+    }
+  }, [fetchLayoutBlocks]);
+
+  const exportLayoutBlock = useCallback(async (blockId: string): Promise<object> => {
+    try {
+      const data = await fetchApi<object>(`/layout-blocks/${blockId}/export`);
+      return data;
+    } catch (e) {
+      throw new Error(e instanceof Error ? e.message : 'Failed to export layout block');
+    }
+  }, []);
+
+  const importLayoutBlock = useCallback(async (sectionId: string, importData: object): Promise<{
+    success: boolean;
+    block_id: string;
+    name: string;
+    items_imported: number;
+    items_skipped: number;
+    skipped_collections: string[];
+    message: string;
+  }> => {
+    try {
+      const data = await fetchApi<{
+        success: boolean;
+        block_id: string;
+        name: string;
+        items_imported: number;
+        items_skipped: number;
+        skipped_collections: string[];
+        message: string;
+      }>(`/libraries/${sectionId}/layout-blocks/import`, {
+        method: 'POST',
+        body: JSON.stringify(importData),
+      });
+      await fetchLayoutBlocks();
+      return data;
+    } catch (e) {
+      throw new Error(e instanceof Error ? e.message : 'Failed to import layout block');
+    }
+  }, [fetchLayoutBlocks]);
+
   return {
     layoutBlocks,
     loading,
@@ -586,8 +703,137 @@ export function useLayoutBlocks(sectionId: string | null) {
     createLayoutBlock,
     updateLayoutBlock,
     deleteLayoutBlock,
+    duplicateLayoutBlock,
+    exportLayoutBlock,
+    importLayoutBlock,
     getLayoutBlockItems,
     saveLayoutBlockItems,
+  };
+}
+
+// Saved layout type
+export interface SavedLayout {
+  id: string;
+  library_section_id: string;
+  name: string;
+  description?: string;
+  items_count: number;
+  created_at: string;
+  layout_data?: {
+    items: Array<{
+      hub_identifier: string;
+      collection_title: string;
+      order_index: number;
+      visible_home: boolean;
+      visible_shared_home: boolean;
+      visible_shared_friends: boolean;
+    }>;
+  };
+}
+
+export function useSavedLayouts(sectionId: string | null) {
+  const [savedLayouts, setSavedLayouts] = useState<SavedLayout[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const fetchSavedLayouts = useCallback(async () => {
+    if (!sectionId) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const data = await fetchApi<{ saved_layouts: SavedLayout[] }>(
+        `/libraries/${sectionId}/saved-layouts`
+      );
+      setSavedLayouts(data.saved_layouts);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to fetch saved layouts');
+    } finally {
+      setLoading(false);
+    }
+  }, [sectionId]);
+
+  const saveLayout = useCallback(async (
+    blockId: string,
+    name: string,
+    description?: string
+  ): Promise<{ success: boolean; saved_layout: SavedLayout; message: string }> => {
+    try {
+      const data = await fetchApi<{ success: boolean; saved_layout: SavedLayout; message: string }>(
+        `/layout-blocks/${blockId}/save`,
+        {
+          method: 'POST',
+          body: JSON.stringify({ name, description }),
+        }
+      );
+      await fetchSavedLayouts();
+      return data;
+    } catch (e) {
+      throw new Error(e instanceof Error ? e.message : 'Failed to save layout');
+    }
+  }, [fetchSavedLayouts]);
+
+  const loadSavedLayout = useCallback(async (
+    layoutId: string,
+    name: string,
+    startAt: string,
+    endAt: string,
+    repeatYearly: boolean = false
+  ): Promise<{
+    success: boolean;
+    block_id: string;
+    name: string;
+    items_loaded: number;
+    items_skipped: number;
+    skipped_collections: string[];
+    message: string;
+  }> => {
+    if (!sectionId) throw new Error('No library selected');
+    try {
+      const data = await fetchApi<{
+        success: boolean;
+        block_id: string;
+        name: string;
+        items_loaded: number;
+        items_skipped: number;
+        skipped_collections: string[];
+        message: string;
+      }>(
+        `/libraries/${sectionId}/saved-layouts/${layoutId}/load`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            name,
+            start_at: startAt,
+            end_at: endAt,
+            repeat_yearly: repeatYearly,
+          }),
+        }
+      );
+      return data;
+    } catch (e) {
+      throw new Error(e instanceof Error ? e.message : 'Failed to load saved layout');
+    }
+  }, [sectionId]);
+
+  const deleteSavedLayout = useCallback(async (layoutId: string) => {
+    try {
+      await fetchApi(`/saved-layouts/${layoutId}`, {
+        method: 'DELETE',
+      });
+      await fetchSavedLayouts();
+    } catch (e) {
+      throw new Error(e instanceof Error ? e.message : 'Failed to delete saved layout');
+    }
+  }, [fetchSavedLayouts]);
+
+  return {
+    savedLayouts,
+    loading,
+    error,
+    fetchSavedLayouts,
+    saveLayout,
+    loadSavedLayout,
+    deleteSavedLayout,
   };
 }
 
@@ -770,5 +1016,97 @@ export function useCollectionSchedule(collectionName: string | null) {
     loading,
     error,
     fetchSchedule,
+  };
+}
+
+export function usePromotions(sectionId: string | null) {
+  const [promotions, setPromotions] = useState<Promotion[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const fetchPromotions = useCallback(async () => {
+    if (!sectionId) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const data = await fetchApi<{ promotions: Promotion[] }>(
+        `/libraries/${sectionId}/promotions`
+      );
+      setPromotions(data.promotions);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to fetch promotions');
+    } finally {
+      setLoading(false);
+    }
+  }, [sectionId]);
+
+  const createPromotion = useCallback(async (promotion: PromotionCreate) => {
+    if (!sectionId) return null;
+    try {
+      const data = await fetchApi<Promotion>(`/libraries/${sectionId}/promotions`, {
+        method: 'POST',
+        body: JSON.stringify(promotion),
+      });
+      await fetchPromotions();
+      return data;
+    } catch (e) {
+      throw new Error(e instanceof Error ? e.message : 'Failed to create promotion');
+    }
+  }, [sectionId, fetchPromotions]);
+
+  const updatePromotion = useCallback(async (promotionId: string, updates: PromotionUpdate) => {
+    try {
+      const data = await fetchApi<Promotion>(`/promotions/${promotionId}`, {
+        method: 'PUT',
+        body: JSON.stringify(updates),
+      });
+      await fetchPromotions();
+      return data;
+    } catch (e) {
+      throw new Error(e instanceof Error ? e.message : 'Failed to update promotion');
+    }
+  }, [fetchPromotions]);
+
+  const deletePromotion = useCallback(async (promotionId: string) => {
+    try {
+      await fetchApi(`/promotions/${promotionId}`, {
+        method: 'DELETE',
+      });
+      await fetchPromotions();
+    } catch (e) {
+      throw new Error(e instanceof Error ? e.message : 'Failed to delete promotion');
+    }
+  }, [fetchPromotions]);
+
+  const getPromotionItems = useCallback(async (promotionId: string): Promise<PromotionItem[]> => {
+    try {
+      const data = await fetchApi<{ items: PromotionItem[] }>(`/promotions/${promotionId}/items`);
+      return data.items;
+    } catch (e) {
+      throw new Error(e instanceof Error ? e.message : 'Failed to fetch promotion items');
+    }
+  }, []);
+
+  const savePromotionItems = useCallback(async (promotionId: string, items: Omit<PromotionItem, 'id' | 'promotion_id'>[]) => {
+    try {
+      await fetchApi(`/promotions/${promotionId}/items`, {
+        method: 'PUT',
+        body: JSON.stringify({ items }),
+      });
+    } catch (e) {
+      throw new Error(e instanceof Error ? e.message : 'Failed to save promotion items');
+    }
+  }, []);
+
+  return {
+    promotions,
+    loading,
+    error,
+    fetchPromotions,
+    createPromotion,
+    updatePromotion,
+    deletePromotion,
+    getPromotionItems,
+    savePromotionItems,
   };
 }

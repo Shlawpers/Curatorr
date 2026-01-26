@@ -47,6 +47,7 @@ interface Props {
   onRemove: (id: string) => void;
   isPreviewMode: boolean;
   isReadOnly?: boolean; // When true, disables all editing (drag, remove, visibility toggles)
+  editingPromotion?: boolean; // When true, shows promotion-specific UI
 }
 
 interface SortableItemProps {
@@ -253,6 +254,7 @@ export function HomeStack({
   onRemove,
   isPreviewMode,
   isReadOnly = false,
+  editingPromotion = false,
 }: Props) {
   // Track the actively dragged item for the overlay
   const [activeId, setActiveId] = useState<string | null>(null);
@@ -318,8 +320,13 @@ export function HomeStack({
       {/* Header */}
       <div className="flex items-center justify-between mb-3">
         <h2 className="text-lg font-semibold flex items-center gap-2">
-          Home Stack
-          {isPreviewMode && !isReadOnly && (
+          Home Hub Editor
+          {editingPromotion && (
+            <span className="px-2 py-0.5 text-xs bg-purple-500/20 text-purple-400 rounded">
+              Editing Promotion
+            </span>
+          )}
+          {isPreviewMode && !isReadOnly && !editingPromotion && (
             <span className="px-2 py-0.5 text-xs bg-plex-gold/20 text-plex-gold rounded">
               Editing Block
             </span>
@@ -331,7 +338,7 @@ export function HomeStack({
           )}
           {!isPreviewMode && (
             <span className="px-2 py-0.5 text-xs bg-green-500/20 text-green-400 rounded">
-              Base Template
+              Current Layout
             </span>
           )}
         </h2>
@@ -352,7 +359,7 @@ export function HomeStack({
       )}
       {isReadOnly && (
         <div className="mb-3 p-2 bg-gray-700/30 border border-gray-600 rounded-lg text-xs text-gray-400">
-          Viewing what Plex will show at this time. Select a Layout Block from the left panel to edit.
+          Viewing what Plex will show at this time. Select a Schedule from the left panel to edit.
         </div>
       )}
 

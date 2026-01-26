@@ -20,6 +20,8 @@ from models import (
     LayoutBlockItem,
     LibrarySyncSettings,
     SyncResultStatus,
+    Promotion,
+    PromotionItem,
 )
 
 logger = logging.getLogger(__name__)
@@ -587,10 +589,17 @@ async def init_layout_blocks_tables():
                 name TEXT NOT NULL,
                 start_at TEXT NOT NULL,
                 end_at TEXT NOT NULL,
+                repeat_yearly INTEGER DEFAULT 0,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
+        # Migration: Add repeat_yearly column if it doesn't exist
+        try:
+            await db.execute("ALTER TABLE layout_blocks ADD COLUMN repeat_yearly INTEGER DEFAULT 0")
+        except Exception:
+            pass  # Column already exists
 
         # Layout Block Items table
         await db.execute("""
@@ -605,6 +614,19 @@ async def init_layout_blocks_tables():
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (block_id) REFERENCES layout_blocks(id) ON DELETE CASCADE
+            )
+        """)
+
+        # Saved Layouts table (for saving/loading layout templates)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS saved_layouts (
+                id TEXT PRIMARY KEY,
+                library_section_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT,
+                layout_data TEXT NOT NULL,
+                items_count INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """)
 
@@ -632,6 +654,7 @@ async def get_layout_blocks(library_section_id: str) -> list[LayoutBlock]:
                     name=row["name"],
                     start_at=datetime.fromisoformat(row["start_at"]),
                     end_at=datetime.fromisoformat(row["end_at"]),
+                    repeat_yearly=bool(row["repeat_yearly"]) if row["repeat_yearly"] is not None else False,
                     created_at=datetime.fromisoformat(row["created_at"]) if row["created_at"] else None,
                     updated_at=datetime.fromisoformat(row["updated_at"]) if row["updated_at"] else None,
                     items=items,
@@ -658,6 +681,7 @@ async def get_layout_block(block_id: str) -> Optional[LayoutBlock]:
                 name=row["name"],
                 start_at=datetime.fromisoformat(row["start_at"]),
                 end_at=datetime.fromisoformat(row["end_at"]),
+                repeat_yearly=bool(row["repeat_yearly"]) if row["repeat_yearly"] is not None else False,
                 created_at=datetime.fromisoformat(row["created_at"]) if row["created_at"] else None,
                 updated_at=datetime.fromisoformat(row["updated_at"]) if row["updated_at"] else None,
                 items=items,
@@ -669,7 +693,8 @@ async def create_layout_block(
     library_section_id: str,
     name: str,
     start_at: datetime,
-    end_at: datetime
+    end_at: datetime,
+    repeat_yearly: bool = False
 ) -> LayoutBlock:
     """Create a new layout block."""
     now = datetime.now().isoformat()
@@ -679,9 +704,9 @@ async def create_layout_block(
     async with aiosqlite.connect(DATABASE_PATH) as db:
         await db.execute("""
             INSERT INTO layout_blocks
-            (id, library_section_id, name, start_at, end_at, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (block_id, library_section_id, name, start_at_str, end_at_str, now, now))
+            (id, library_section_id, name, start_at, end_at, repeat_yearly, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (block_id, library_section_id, name, start_at_str, end_at_str, int(repeat_yearly), now, now))
         await db.commit()
 
     return LayoutBlock(
@@ -690,6 +715,7 @@ async def create_layout_block(
         name=name,
         start_at=start_at,
         end_at=end_at,
+        repeat_yearly=repeat_yearly,
         created_at=datetime.fromisoformat(now),
         updated_at=datetime.fromisoformat(now),
         items=[],
@@ -700,7 +726,8 @@ async def update_layout_block(
     block_id: str,
     name: Optional[str] = None,
     start_at: Optional[datetime] = None,
-    end_at: Optional[datetime] = None
+    end_at: Optional[datetime] = None,
+    repeat_yearly: Optional[bool] = None
 ) -> Optional[LayoutBlock]:
     """Update a layout block's metadata."""
     existing = await get_layout_block(block_id)
@@ -711,6 +738,7 @@ async def update_layout_block(
     updated_name = name if name is not None else existing.name
     updated_start_at = start_at if start_at is not None else existing.start_at
     updated_end_at = end_at if end_at is not None else existing.end_at
+    updated_repeat_yearly = repeat_yearly if repeat_yearly is not None else existing.repeat_yearly
 
     start_at_str = updated_start_at.isoformat() if isinstance(updated_start_at, datetime) else updated_start_at
     end_at_str = updated_end_at.isoformat() if isinstance(updated_end_at, datetime) else updated_end_at
@@ -718,9 +746,9 @@ async def update_layout_block(
     async with aiosqlite.connect(DATABASE_PATH) as db:
         await db.execute("""
             UPDATE layout_blocks
-            SET name = ?, start_at = ?, end_at = ?, updated_at = ?
+            SET name = ?, start_at = ?, end_at = ?, repeat_yearly = ?, updated_at = ?
             WHERE id = ?
-        """, (updated_name, start_at_str, end_at_str, now, block_id))
+        """, (updated_name, start_at_str, end_at_str, int(updated_repeat_yearly), now, block_id))
         await db.commit()
 
     return await get_layout_block(block_id)
@@ -770,6 +798,9 @@ async def get_active_layout_block(
     Find the active layout block at a given time.
 
     A block is active if: start_at <= at_time < end_at
+    For repeat_yearly blocks, we check if the current month/day falls within
+    the block's month/day range (adjusted for the current year).
+
     If multiple blocks overlap, returns the one with the latest start_at (most specific).
 
     Returns None if no block is active (dead time).
@@ -799,6 +830,7 @@ async def get_active_layout_block(
                 # Parse stored datetime (may have timezone info)
                 start_str = row["start_at"]
                 end_str = row["end_at"]
+                repeat_yearly = bool(row["repeat_yearly"]) if row["repeat_yearly"] is not None else False
 
                 start_at = datetime.fromisoformat(start_str)
                 end_at = datetime.fromisoformat(end_str)
@@ -809,8 +841,40 @@ async def get_active_layout_block(
                 if end_at.tzinfo is not None:
                     end_at = end_at.replace(tzinfo=None)
 
-                # Check if at_time falls within this block's range
-                if start_at <= at_time_utc < end_at:
+                is_active = False
+
+                if repeat_yearly:
+                    # For yearly blocks, check if current month/day falls within range
+                    # Adjust block dates to the current year for comparison
+                    current_year = at_time_utc.year
+
+                    # Handle year boundary (e.g., Dec 15 - Jan 5)
+                    if start_at.month > end_at.month or (start_at.month == end_at.month and start_at.day > end_at.day):
+                        # Block spans year boundary
+                        # Check if we're in the late part of the year (after start)
+                        adjusted_start = start_at.replace(year=current_year)
+                        adjusted_end = end_at.replace(year=current_year + 1)
+
+                        if adjusted_start <= at_time_utc < adjusted_end:
+                            is_active = True
+                        else:
+                            # Or we might be in early part of year (before end)
+                            adjusted_start_prev = start_at.replace(year=current_year - 1)
+                            adjusted_end_prev = end_at.replace(year=current_year)
+                            if adjusted_start_prev <= at_time_utc < adjusted_end_prev:
+                                is_active = True
+                    else:
+                        # Block within same year
+                        adjusted_start = start_at.replace(year=current_year)
+                        adjusted_end = end_at.replace(year=current_year)
+                        if adjusted_start <= at_time_utc < adjusted_end:
+                            is_active = True
+                else:
+                    # Standard non-repeating check
+                    if start_at <= at_time_utc < end_at:
+                        is_active = True
+
+                if is_active:
                     # Get items for this block
                     items = await get_layout_block_items(row["id"])
                     return LayoutBlock(
@@ -819,12 +883,88 @@ async def get_active_layout_block(
                         name=row["name"],
                         start_at=datetime.fromisoformat(row["start_at"]),
                         end_at=datetime.fromisoformat(row["end_at"]),
+                        repeat_yearly=repeat_yearly,
                         created_at=datetime.fromisoformat(row["created_at"]) if row["created_at"] else None,
                         updated_at=datetime.fromisoformat(row["updated_at"]) if row["updated_at"] else None,
                         items=items,
                     )
 
             return None
+
+
+async def duplicate_layout_block(
+    source_block_id: str,
+    new_name: str,
+    shift_years: int = 1
+) -> Optional[LayoutBlock]:
+    """
+    Duplicate a layout block with all its items.
+
+    Args:
+        source_block_id: ID of the block to duplicate
+        new_name: Name for the new block
+        shift_years: How many years to shift the dates forward (default: 1)
+
+    Returns:
+        The newly created LayoutBlock, or None if source not found
+    """
+    import uuid
+    from dateutil.relativedelta import relativedelta
+
+    # Get the source block
+    source = await get_layout_block(source_block_id)
+    if not source:
+        return None
+
+    # Generate new ID
+    new_block_id = str(uuid.uuid4())
+    now = datetime.now().isoformat()
+
+    # Shift dates forward
+    new_start_at = source.start_at + relativedelta(years=shift_years)
+    new_end_at = source.end_at + relativedelta(years=shift_years)
+
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        # Create new block
+        await db.execute("""
+            INSERT INTO layout_blocks
+            (id, library_section_id, name, start_at, end_at, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            new_block_id,
+            source.library_section_id,
+            new_name,
+            new_start_at.isoformat(),
+            new_end_at.isoformat(),
+            now,
+            now,
+        ))
+
+        # Copy all items from source block
+        source_items = await get_layout_block_items(source_block_id)
+        for item in source_items:
+            item_id = str(uuid.uuid4())
+            await db.execute("""
+                INSERT INTO layout_block_items
+                (id, block_id, collection_id, order_index, visible_home,
+                 visible_shared_home, visible_shared_friends, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                item_id,
+                new_block_id,
+                item.collection_id,
+                item.order_index,
+                1 if item.visible_home else 0,
+                1 if item.visible_shared_home else 0,
+                1 if item.visible_shared_friends else 0,
+                now,
+                now,
+            ))
+
+        await db.commit()
+
+    # Return the new block
+    return await get_layout_block(new_block_id)
 
 
 async def save_layout_block_items(block_id: str, items: list[dict]):
@@ -997,3 +1137,368 @@ async def update_sync_status(
             params
         )
         await db.commit()
+
+
+# ================== Promotion Functions ==================
+
+async def init_promotions_tables():
+    """Initialize promotions database tables."""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        # Promotions table
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS promotions (
+                id TEXT PRIMARY KEY,
+                library_section_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                start_at TEXT NOT NULL,
+                end_at TEXT NOT NULL,
+                repeat_yearly INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Promotion Items table
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS promotion_items (
+                id TEXT PRIMARY KEY,
+                promotion_id TEXT NOT NULL,
+                hub_identifier TEXT NOT NULL,
+                order_index INTEGER NOT NULL,
+                visible_home INTEGER DEFAULT 1,
+                visible_shared_home INTEGER DEFAULT 1,
+                visible_shared_friends INTEGER DEFAULT 1,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (promotion_id) REFERENCES promotions(id) ON DELETE CASCADE
+            )
+        """)
+
+        await db.commit()
+        logger.info("Promotions tables initialized")
+
+
+async def get_promotions(library_section_id: str) -> list[Promotion]:
+    """Get all promotions for a library."""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM promotions WHERE library_section_id = ? ORDER BY start_at",
+            (library_section_id,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+
+            promotions = []
+            for row in rows:
+                items = await get_promotion_items(row["id"])
+                promotions.append(Promotion(
+                    id=row["id"],
+                    library_section_id=row["library_section_id"],
+                    name=row["name"],
+                    start_at=datetime.fromisoformat(row["start_at"]),
+                    end_at=datetime.fromisoformat(row["end_at"]),
+                    repeat_yearly=bool(row["repeat_yearly"]),
+                    created_at=datetime.fromisoformat(row["created_at"]) if row["created_at"] else None,
+                    updated_at=datetime.fromisoformat(row["updated_at"]) if row["updated_at"] else None,
+                    items=items,
+                ))
+            return promotions
+
+
+async def get_promotion(promotion_id: str) -> Optional[Promotion]:
+    """Get a single promotion by ID."""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM promotions WHERE id = ?", (promotion_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                return None
+
+            items = await get_promotion_items(promotion_id)
+            return Promotion(
+                id=row["id"],
+                library_section_id=row["library_section_id"],
+                name=row["name"],
+                start_at=datetime.fromisoformat(row["start_at"]),
+                end_at=datetime.fromisoformat(row["end_at"]),
+                repeat_yearly=bool(row["repeat_yearly"]),
+                created_at=datetime.fromisoformat(row["created_at"]) if row["created_at"] else None,
+                updated_at=datetime.fromisoformat(row["updated_at"]) if row["updated_at"] else None,
+                items=items,
+            )
+
+
+async def create_promotion(
+    promotion_id: str,
+    library_section_id: str,
+    name: str,
+    start_at: datetime,
+    end_at: datetime,
+    repeat_yearly: bool = False
+) -> Promotion:
+    """Create a new promotion."""
+    now = datetime.now().isoformat()
+    start_at_str = start_at.isoformat() if isinstance(start_at, datetime) else start_at
+    end_at_str = end_at.isoformat() if isinstance(end_at, datetime) else end_at
+
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute("""
+            INSERT INTO promotions
+            (id, library_section_id, name, start_at, end_at, repeat_yearly, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (promotion_id, library_section_id, name, start_at_str, end_at_str,
+              1 if repeat_yearly else 0, now, now))
+        await db.commit()
+
+    return Promotion(
+        id=promotion_id,
+        library_section_id=library_section_id,
+        name=name,
+        start_at=start_at,
+        end_at=end_at,
+        repeat_yearly=repeat_yearly,
+        created_at=datetime.fromisoformat(now),
+        updated_at=datetime.fromisoformat(now),
+        items=[],
+    )
+
+
+async def update_promotion(
+    promotion_id: str,
+    name: Optional[str] = None,
+    start_at: Optional[datetime] = None,
+    end_at: Optional[datetime] = None,
+    repeat_yearly: Optional[bool] = None
+) -> Optional[Promotion]:
+    """Update a promotion's metadata."""
+    existing = await get_promotion(promotion_id)
+    if not existing:
+        return None
+
+    now = datetime.now().isoformat()
+    updated_name = name if name is not None else existing.name
+    updated_start_at = start_at if start_at is not None else existing.start_at
+    updated_end_at = end_at if end_at is not None else existing.end_at
+    updated_repeat_yearly = repeat_yearly if repeat_yearly is not None else existing.repeat_yearly
+
+    start_at_str = updated_start_at.isoformat() if isinstance(updated_start_at, datetime) else updated_start_at
+    end_at_str = updated_end_at.isoformat() if isinstance(updated_end_at, datetime) else updated_end_at
+
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute("""
+            UPDATE promotions
+            SET name = ?, start_at = ?, end_at = ?, repeat_yearly = ?, updated_at = ?
+            WHERE id = ?
+        """, (updated_name, start_at_str, end_at_str,
+              1 if updated_repeat_yearly else 0, now, promotion_id))
+        await db.commit()
+
+    return await get_promotion(promotion_id)
+
+
+async def delete_promotion(promotion_id: str):
+    """Delete a promotion and its items."""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute("DELETE FROM promotion_items WHERE promotion_id = ?", (promotion_id,))
+        await db.execute("DELETE FROM promotions WHERE id = ?", (promotion_id,))
+        await db.commit()
+
+
+async def get_promotion_items(promotion_id: str) -> list[PromotionItem]:
+    """Get all items for a promotion."""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM promotion_items WHERE promotion_id = ? ORDER BY order_index",
+            (promotion_id,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+
+            items = []
+            for row in rows:
+                items.append(PromotionItem(
+                    id=row["id"],
+                    promotion_id=row["promotion_id"],
+                    hub_identifier=row["hub_identifier"],
+                    order_index=row["order_index"],
+                    visible_home=bool(row["visible_home"]),
+                    visible_shared_home=bool(row["visible_shared_home"]),
+                    visible_shared_friends=bool(row["visible_shared_friends"]),
+                    created_at=datetime.fromisoformat(row["created_at"]) if row["created_at"] else None,
+                    updated_at=datetime.fromisoformat(row["updated_at"]) if row["updated_at"] else None,
+                ))
+            return items
+
+
+async def save_promotion_items(promotion_id: str, items: list[dict]):
+    """Replace all items for a promotion (bulk save)."""
+    import uuid
+    now = datetime.now().isoformat()
+
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        # Delete existing items
+        await db.execute("DELETE FROM promotion_items WHERE promotion_id = ?", (promotion_id,))
+
+        # Insert new items
+        for item in items:
+            item_id = str(uuid.uuid4())
+            await db.execute("""
+                INSERT INTO promotion_items
+                (id, promotion_id, hub_identifier, order_index, visible_home,
+                 visible_shared_home, visible_shared_friends, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                item_id,
+                promotion_id,
+                item["hub_identifier"],
+                item["order_index"],
+                1 if item.get("visible_home", True) else 0,
+                1 if item.get("visible_shared_home", True) else 0,
+                1 if item.get("visible_shared_friends", True) else 0,
+                now,
+                now,
+            ))
+
+        await db.commit()
+
+
+async def get_active_promotions(
+    library_section_id: str,
+    at_time: datetime
+) -> list[Promotion]:
+    """
+    Find all active promotions at a given time.
+
+    A promotion is active if: start_at <= at_time < end_at
+    For yearly repeating promotions, checks if the month/day falls within range
+    regardless of year.
+
+    Returns all active promotions sorted by start_at.
+    """
+    all_promotions = await get_promotions(library_section_id)
+    active = []
+
+    # Make at_time timezone-naive for comparison
+    if at_time.tzinfo is not None:
+        at_time = at_time.replace(tzinfo=None)
+
+    for promo in all_promotions:
+        start = promo.start_at
+        end = promo.end_at
+
+        # Make datetimes timezone-naive
+        if start.tzinfo is not None:
+            start = start.replace(tzinfo=None)
+        if end.tzinfo is not None:
+            end = end.replace(tzinfo=None)
+
+        if promo.repeat_yearly:
+            # For yearly repeating, check if current month/day falls in range
+            # Adjust the year to match at_time
+            current_year = at_time.year
+            adjusted_start = start.replace(year=current_year)
+            adjusted_end = end.replace(year=current_year)
+
+            # Handle year boundary (e.g., Dec 15 - Jan 5)
+            if adjusted_end < adjusted_start:
+                # Promotion spans year boundary
+                if at_time >= adjusted_start or at_time < adjusted_end.replace(year=current_year + 1):
+                    active.append(promo)
+            else:
+                # Normal case
+                if adjusted_start <= at_time < adjusted_end:
+                    active.append(promo)
+        else:
+            # One-time promotion
+            if start <= at_time < end:
+                active.append(promo)
+
+    return active
+
+
+# ================== Saved Layouts ==================
+
+async def get_saved_layouts(library_section_id: str) -> list[dict]:
+    """Get all saved layouts for a library."""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM saved_layouts WHERE library_section_id = ? ORDER BY created_at DESC",
+            (library_section_id,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [
+                {
+                    "id": row["id"],
+                    "library_section_id": row["library_section_id"],
+                    "name": row["name"],
+                    "description": row["description"],
+                    "items_count": row["items_count"],
+                    "created_at": row["created_at"],
+                }
+                for row in rows
+            ]
+
+
+async def get_saved_layout(layout_id: str) -> Optional[dict]:
+    """Get a saved layout by ID including its data."""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM saved_layouts WHERE id = ?",
+            (layout_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                return None
+            return {
+                "id": row["id"],
+                "library_section_id": row["library_section_id"],
+                "name": row["name"],
+                "description": row["description"],
+                "layout_data": json.loads(row["layout_data"]),
+                "items_count": row["items_count"],
+                "created_at": row["created_at"],
+            }
+
+
+async def create_saved_layout(
+    layout_id: str,
+    library_section_id: str,
+    name: str,
+    layout_data: dict,
+    description: str = None
+) -> dict:
+    """Save a layout template."""
+    now = datetime.now().isoformat()
+    items_count = len(layout_data.get("items", []))
+
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute("""
+            INSERT INTO saved_layouts
+            (id, library_section_id, name, description, layout_data, items_count, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (layout_id, library_section_id, name, description, json.dumps(layout_data), items_count, now))
+        await db.commit()
+
+    return {
+        "id": layout_id,
+        "library_section_id": library_section_id,
+        "name": name,
+        "description": description,
+        "items_count": items_count,
+        "created_at": now,
+    }
+
+
+async def delete_saved_layout(layout_id: str) -> bool:
+    """Delete a saved layout."""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute(
+            "DELETE FROM saved_layouts WHERE id = ?",
+            (layout_id,)
+        )
+        await db.commit()
+        return cursor.rowcount > 0
