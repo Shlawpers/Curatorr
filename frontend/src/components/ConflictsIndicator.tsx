@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
-import { AlertTriangle, ChevronDown, ChevronUp, Clock, XCircle } from 'lucide-react';
+import { AlertTriangle, ChevronDown, ChevronUp, Clock, XCircle, Wrench, Loader2, CheckCircle, X } from 'lucide-react';
 import type { BlockConflictsResponse, ScheduleConflict } from '../types';
+import { fixKometaSchedule, FixKometaScheduleResult } from '../hooks/useApi';
 
 interface ConflictBadgeProps {
   blockId: string;
@@ -140,7 +141,19 @@ export function ConflictsPanel({ blockId, expanded = true }: ConflictsPanelProps
           </p>
 
           {conflicts.conflicts.map((conflict, index) => (
-            <ConflictItem key={index} conflict={conflict} />
+            <ConflictItem
+              key={index}
+              conflict={conflict}
+              onFixed={() => {
+                // Refresh conflicts after a fix
+                if (blockId) {
+                  fetch(`/api/layout-blocks/${blockId}/conflicts`)
+                    .then(res => res.json())
+                    .then(data => setConflicts(data))
+                    .catch(console.error);
+                }
+              }}
+            />
           ))}
         </div>
       )}
@@ -150,9 +163,14 @@ export function ConflictsPanel({ blockId, expanded = true }: ConflictsPanelProps
 
 interface ConflictItemProps {
   conflict: ScheduleConflict;
+  onFixed?: () => void;
 }
 
-function ConflictItem({ conflict }: ConflictItemProps) {
+function ConflictItem({ conflict, onFixed }: ConflictItemProps) {
+  const [showConfirm, setShowConfirm] = useState(false);
+  const [fixing, setFixing] = useState(false);
+  const [fixResult, setFixResult] = useState<FixKometaScheduleResult | null>(null);
+
   const getIcon = () => {
     switch (conflict.conflict_type) {
       case 'deleted_during_block':
@@ -179,30 +197,167 @@ function ConflictItem({ conflict }: ConflictItemProps) {
     }
   };
 
+  const handleFixClick = () => {
+    setShowConfirm(true);
+    setFixResult(null);
+  };
+
+  const handleConfirmFix = async () => {
+    if (!conflict.suggested_schedule) return;
+
+    setFixing(true);
+    try {
+      const result = await fixKometaSchedule(
+        conflict.collection_name,
+        conflict.suggested_schedule
+      );
+      setFixResult(result);
+      if (result.success) {
+        // Wait a moment to show success, then close
+        setTimeout(() => {
+          setShowConfirm(false);
+          onFixed?.();
+        }, 1500);
+      }
+    } catch (e) {
+      setFixResult({
+        success: false,
+        message: e instanceof Error ? e.message : 'Failed to apply fix',
+        file_path: null,
+        old_schedule: conflict.kometa_schedule || null,
+        new_schedule: conflict.suggested_schedule,
+      });
+    } finally {
+      setFixing(false);
+    }
+  };
+
   return (
-    <div className="bg-plex-dark/50 rounded p-3 text-sm">
-      <div className="flex items-start gap-2">
-        {getIcon()}
-        <div className="flex-1 min-w-0">
-          <div className="font-medium truncate">{conflict.collection_name}</div>
-          <div className="text-xs text-gray-500 mt-1">{getTypeLabel()}</div>
-          <div className="text-xs text-gray-400 mt-1">{conflict.message}</div>
+    <>
+      <div className="bg-plex-dark/50 rounded p-3 text-sm">
+        <div className="flex items-start gap-2">
+          {getIcon()}
+          <div className="flex-1 min-w-0">
+            <div className="font-medium truncate">{conflict.collection_name}</div>
+            <div className="text-xs text-gray-500 mt-1">{getTypeLabel()}</div>
+            <div className="text-xs text-gray-400 mt-1">{conflict.message}</div>
 
-          {conflict.kometa_schedule && (
-            <div className="text-xs text-gray-500 mt-2">
-              <span className="text-gray-600">Kometa schedule:</span>{' '}
-              <code className="bg-plex-border/50 px-1 rounded">{conflict.kometa_schedule}</code>
-            </div>
-          )}
+            {conflict.kometa_schedule && (
+              <div className="text-xs text-gray-500 mt-2">
+                <span className="text-gray-600">Kometa schedule:</span>{' '}
+                <code className="bg-plex-border/50 px-1 rounded">{conflict.kometa_schedule}</code>
+              </div>
+            )}
 
-          {conflict.suggested_schedule && (
-            <div className="text-xs text-green-400 mt-1">
-              <span className="text-gray-500">Suggested fix:</span>{' '}
-              <code className="bg-green-500/10 px-1 rounded">{conflict.suggested_schedule}</code>
-            </div>
-          )}
+            {conflict.suggested_schedule && (
+              <div className="flex items-center gap-2 mt-2">
+                <div className="text-xs text-green-400 flex-1">
+                  <span className="text-gray-500">Suggested fix:</span>{' '}
+                  <code className="bg-green-500/10 px-1 rounded">{conflict.suggested_schedule}</code>
+                </div>
+                <button
+                  onClick={handleFixClick}
+                  className="flex items-center gap-1 px-2 py-1 text-xs bg-green-600 hover:bg-green-500 text-white rounded transition-colors"
+                  title="Apply this fix to the Kometa YAML file"
+                >
+                  <Wrench className="w-3 h-3" />
+                  Fix
+                </button>
+              </div>
+            )}
+          </div>
         </div>
       </div>
-    </div>
+
+      {/* Confirmation Modal */}
+      {showConfirm && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <div className="bg-plex-card border border-plex-border rounded-lg p-4 max-w-md w-full mx-4 shadow-xl">
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="font-medium text-lg">Fix Kometa Schedule</h3>
+              <button
+                onClick={() => setShowConfirm(false)}
+                className="p-1 hover:bg-plex-border rounded transition-colors"
+                disabled={fixing}
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {fixResult ? (
+              <div className={`p-3 rounded ${fixResult.success ? 'bg-green-500/10 border border-green-500/30' : 'bg-red-500/10 border border-red-500/30'}`}>
+                <div className="flex items-center gap-2">
+                  {fixResult.success ? (
+                    <CheckCircle className="w-5 h-5 text-green-400" />
+                  ) : (
+                    <XCircle className="w-5 h-5 text-red-400" />
+                  )}
+                  <span className={fixResult.success ? 'text-green-400' : 'text-red-400'}>
+                    {fixResult.message}
+                  </span>
+                </div>
+                {fixResult.file_path && (
+                  <div className="text-xs text-gray-500 mt-2 truncate">
+                    File: {fixResult.file_path}
+                  </div>
+                )}
+              </div>
+            ) : (
+              <>
+                <p className="text-sm text-gray-300 mb-4">
+                  This will modify the Kometa YAML file for <strong>{conflict.collection_name}</strong>:
+                </p>
+
+                <div className="space-y-2 mb-4">
+                  <div className="text-xs">
+                    <span className="text-gray-500">Current:</span>
+                    <code className="ml-2 bg-red-500/10 text-red-400 px-2 py-1 rounded block mt-1">
+                      schedule: {conflict.kometa_schedule || '(none)'}
+                    </code>
+                  </div>
+                  <div className="text-xs">
+                    <span className="text-gray-500">New:</span>
+                    <code className="ml-2 bg-green-500/10 text-green-400 px-2 py-1 rounded block mt-1">
+                      schedule: {conflict.suggested_schedule}
+                    </code>
+                  </div>
+                </div>
+
+                <p className="text-xs text-gray-500 mb-4">
+                  Note: Kometa volume must be mounted read-write for this to work.
+                </p>
+
+                <div className="flex gap-2 justify-end">
+                  <button
+                    onClick={() => setShowConfirm(false)}
+                    className="px-3 py-1.5 text-sm text-gray-400 hover:text-white transition-colors"
+                    disabled={fixing}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    onClick={handleConfirmFix}
+                    disabled={fixing}
+                    className="flex items-center gap-2 px-3 py-1.5 text-sm bg-green-600 hover:bg-green-500 text-white rounded transition-colors disabled:opacity-50"
+                  >
+                    {fixing ? (
+                      <>
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                        Applying...
+                      </>
+                    ) : (
+                      <>
+                        <Wrench className="w-4 h-4" />
+                        Apply Fix
+                      </>
+                    )}
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+    </>
   );
 }

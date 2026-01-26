@@ -3175,6 +3175,56 @@ async def get_layout_block_conflicts(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+class FixKometaScheduleRequest(BaseModel):
+    collection_name: str
+    new_schedule: str
+
+
+@app.post("/api/kometa/fix-schedule")
+async def fix_kometa_schedule(request: FixKometaScheduleRequest):
+    """
+    Apply a suggested schedule fix to a Kometa collection's YAML file.
+
+    This performs a surgical string replacement to preserve formatting and comments.
+    Requires the Kometa config volume to be mounted read-write.
+
+    Returns:
+        - success: Whether the fix was applied
+        - message: Description of what happened
+        - file_path: Path to the modified file
+        - old_schedule: The previous schedule value
+        - new_schedule: The new schedule value
+    """
+    try:
+        if not settings.kometa_config_path:
+            raise HTTPException(
+                status_code=400,
+                detail="Kometa config path not configured"
+            )
+
+        scanner = KometaScanner(settings.kometa_config_path)
+
+        # Rescan to ensure cache is fresh
+        scanner.scan()
+
+        result = scanner.fix_collection_schedule(
+            collection_name=request.collection_name,
+            new_schedule=request.new_schedule
+        )
+
+        if not result["success"]:
+            # Return 200 with success=false so frontend can show the message
+            return result
+
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to fix Kometa schedule: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/collections/{collection_name}/schedule")
 async def get_collection_schedule_info(
     collection_name: str,

@@ -1110,3 +1110,26 @@ export function usePromotions(sectionId: string | null) {
     savePromotionItems,
   };
 }
+
+// ================== Kometa Schedule Fix ==================
+
+export interface FixKometaScheduleResult {
+  success: boolean;
+  message: string;
+  file_path: string | null;
+  old_schedule: string | null;
+  new_schedule: string;
+}
+
+export async function fixKometaSchedule(
+  collectionName: string,
+  newSchedule: string
+): Promise<FixKometaScheduleResult> {
+  return fetchApi<FixKometaScheduleResult>('/kometa/fix-schedule', {
+    method: 'POST',
+    body: JSON.stringify({
+      collection_name: collectionName,
+      new_schedule: newSchedule,
+    }),
+  });
+}

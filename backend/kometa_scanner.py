@@ -1,5 +1,6 @@
 """Kometa YAML scanner for discovering collection definitions."""
 import os
+import re
 import yaml
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -205,3 +206,177 @@ class KometaScanner:
     def get_collection_files(self) -> list[str]:
         """Get list of all scanned collection file names."""
         return list(set(c.file_name for c in self._collections_cache))
+
+    def fix_collection_schedule(
+        self,
+        collection_name: str,
+        new_schedule: str
+    ) -> dict:
+        """
+        Surgically update a collection's schedule in its Kometa YAML file.
+
+        Uses string replacement to preserve formatting and comments.
+
+        Args:
+            collection_name: Name of the collection to fix
+            new_schedule: New schedule value (e.g., "range(12/01-01/05)")
+
+        Returns:
+            dict with: success, message, file_path, old_schedule, new_schedule
+        """
+        # Find the collection in cache
+        collection = self.get_collection_by_name(collection_name)
+        if not collection:
+            return {
+                "success": False,
+                "message": f"Collection '{collection_name}' not found in Kometa config",
+                "file_path": None,
+                "old_schedule": None,
+                "new_schedule": new_schedule
+            }
+
+        file_path = Path(collection.file_path)
+        old_schedule = collection.schedule
+
+        if not file_path.exists():
+            return {
+                "success": False,
+                "message": f"File not found: {file_path}",
+                "file_path": str(file_path),
+                "old_schedule": str(old_schedule) if old_schedule else None,
+                "new_schedule": new_schedule
+            }
+
+        try:
+            # Read the file content as string
+            with open(file_path, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            # Find and replace the schedule for this specific collection
+            # We need to find the collection block and its schedule line
+            modified_content = self._surgical_schedule_replace(
+                content, collection_name, old_schedule, new_schedule
+            )
+
+            if modified_content == content:
+                return {
+                    "success": False,
+                    "message": f"Could not locate schedule for '{collection_name}' in file",
+                    "file_path": str(file_path),
+                    "old_schedule": str(old_schedule) if old_schedule else None,
+                    "new_schedule": new_schedule
+                }
+
+            # Write the modified content back
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(modified_content)
+
+            # Update the cache
+            collection.schedule = new_schedule
+
+            logger.info(f"Updated schedule for '{collection_name}' in {file_path.name}: {old_schedule} -> {new_schedule}")
+
+            return {
+                "success": True,
+                "message": f"Successfully updated schedule for '{collection_name}'",
+                "file_path": str(file_path),
+                "old_schedule": str(old_schedule) if old_schedule else None,
+                "new_schedule": new_schedule
+            }
+
+        except PermissionError:
+            return {
+                "success": False,
+                "message": f"Permission denied: Cannot write to {file_path}. Is the volume mounted read-only?",
+                "file_path": str(file_path),
+                "old_schedule": str(old_schedule) if old_schedule else None,
+                "new_schedule": new_schedule
+            }
+        except Exception as e:
+            logger.error(f"Error fixing schedule for '{collection_name}': {e}")
+            return {
+                "success": False,
+                "message": f"Error updating file: {str(e)}",
+                "file_path": str(file_path),
+                "old_schedule": str(old_schedule) if old_schedule else None,
+                "new_schedule": new_schedule
+            }
+
+    def _surgical_schedule_replace(
+        self,
+        content: str,
+        collection_name: str,
+        old_schedule: str | list | None,
+        new_schedule: str
+    ) -> str:
+        """
+        Surgically replace the schedule for a specific collection in YAML content.
+
+        This preserves formatting and comments by doing targeted string replacement
+        rather than parsing and rewriting the entire YAML.
+        """
+        lines = content.split('\n')
+        modified_lines = []
+
+        in_collections_section = False
+        in_target_collection = False
+        collection_indent = 0
+        found_and_replaced = False
+
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            stripped = line.lstrip()
+            current_indent = len(line) - len(stripped)
+
+            # Track if we're in the collections: section
+            if stripped.startswith('collections:'):
+                in_collections_section = True
+                modified_lines.append(line)
+                i += 1
+                continue
+
+            # If in collections section, look for our target collection
+            if in_collections_section:
+                # Check if this line starts a collection (name followed by colon)
+                # Collection names are at a consistent indent level under 'collections:'
+                if stripped and not stripped.startswith('#') and ':' in stripped:
+                    potential_name = stripped.split(':')[0].strip()
+                    # Remove quotes if present
+                    potential_name = potential_name.strip('"\'')
+
+                    if potential_name == collection_name:
+                        in_target_collection = True
+                        collection_indent = current_indent
+                        modified_lines.append(line)
+                        i += 1
+                        continue
+                    elif in_target_collection and current_indent <= collection_indent:
+                        # We've moved past our collection
+                        in_target_collection = False
+
+            # If we're in the target collection, look for the schedule line
+            if in_target_collection and not found_and_replaced:
+                if stripped.startswith('schedule:'):
+                    # Found the schedule line - replace it
+                    indent_str = line[:current_indent]
+                    new_line = f"{indent_str}schedule: {new_schedule}"
+                    modified_lines.append(new_line)
+                    found_and_replaced = True
+                    i += 1
+                    continue
+
+            modified_lines.append(line)
+            i += 1
+
+        # If we found and replaced, return modified content
+        if found_and_replaced:
+            return '\n'.join(modified_lines)
+
+        # If collection had no schedule line but we need to add one
+        # This is more complex - we'd need to insert a new line
+        # For now, only support replacing existing schedules
+        if in_target_collection and old_schedule is None:
+            logger.warning(f"Collection '{collection_name}' has no existing schedule line to modify")
+
+        return content  # Return unchanged if we couldn't find it
