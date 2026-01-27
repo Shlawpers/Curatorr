@@ -108,6 +108,54 @@ Save any layout as a reusable template:
 | ⚫ Gray dot + "Ended" | Schedule has passed |
 | 🔄 Repeat icon | Repeats every year |
 
+## Kometa Integration
+
+Curatorr works alongside Kometa, the popular Plex collection manager. If you use Kometa to create collections with scheduled date ranges, Curatorr can detect potential conflicts.
+
+### Schedule Conflict Detection
+
+When you select a layout block, Curatorr checks if any collections in that block have Kometa schedules that don't cover the full block duration. For example:
+
+- Your block runs Feb 1-28
+- A collection's Kometa schedule is `range(12/01-01/31)`
+- Curatorr warns: "This collection will be deleted after Jan 31 but your block runs until Feb 28"
+
+A yellow warning badge on the block indicates conflicts. Click the block to see details in the right panel.
+
+### Auto-Fix Kometa Schedules
+
+When a conflict is detected, Curatorr suggests a new schedule and offers to fix it automatically:
+
+1. Click the green **Fix** button next to the suggested schedule
+2. Review the before/after in the confirmation modal
+3. Click **Apply Fix** to update the Kometa YAML file
+
+The fix uses surgical string replacement - only the `schedule:` line changes, preserving all your comments and formatting.
+
+### Configuring Kometa Access
+
+To enable auto-fix, mount your Kometa config directory as **read-write**:
+
+```yaml
+# docker-compose.yaml
+services:
+  curatorr:
+    volumes:
+      - /path/to/kometa/config:/kometa:rw  # Read-write for auto-fix
+```
+
+For read-only access (conflict detection only, no fixing):
+
+```yaml
+      - /path/to/kometa/config:/kometa:ro  # Read-only
+```
+
+If mounted read-only, the Fix button will show an error explaining the volume isn't writable.
+
+### Limitations
+
+The auto-fix only updates the `schedule:` line in Kometa collection files. If your collections also have `visible_home`, `visible_shared`, or `visible_library` date ranges, you'll need to update those manually in the YAML files.
+
 ## Tips
 
 **Start with dry-run mode** until you're comfortable. You can see exactly what would change without affecting your Plex server.
