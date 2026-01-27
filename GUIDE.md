@@ -118,7 +118,12 @@ Save any layout as a reusable template:
 
 ## Kometa Integration
 
-Curatorr works alongside Kometa, the popular Plex collection manager. If you use Kometa to create collections with scheduled date ranges, Curatorr can detect potential conflicts.
+Curatorr works alongside Kometa. If you use Kometa, mount your config folder to populate collection pool with kometa collections and enable schedule conflict detection. If you use Kometa to create collections with scheduled date ranges, Curatorr can detect potential conflicts.
+
+Curatorr reads your Kometa YAML files and warns you when a collection's schedule conflicts with your layout block. Mount with `:rw` instead of `:ro` to enable one-click conflict auto-fix
+
+![Kometa Auto-Fix](docs/screenshots/kometa-fix-modal.png)
+
 
 ### Schedule Conflict Detection
 
@@ -130,9 +135,9 @@ When you select a layout block, Curatorr checks if any collections in that block
 
 A yellow warning badge on the block indicates conflicts. Click the block to see details in the right panel.
 
-### Auto-Fix Kometa Schedules
+### Auto-Sync Kometa Schedules
 
-When a conflict is detected, Curatorr suggests a new schedule and offers to fix it automatically:
+When a conflict is detected, Curatorr suggests a new schedule and offers to sync it automatically:
 
 1. Click the green **Fix** button next to the suggested schedule
 2. Review the before/after in the confirmation modal
@@ -144,7 +149,7 @@ The fix uses surgical string replacement - only the `schedule:` line changes, pr
 
 ### Configuring Kometa Access
 
-To enable auto-fix, mount your Kometa config directory as **read-write**:
+To enable auto-sync, mount your Kometa config directory as **read-write**:
 
 ```yaml
 # docker-compose.yaml
@@ -162,7 +167,7 @@ For read-only access (conflict detection only, no fixing):
 
 If mounted read-only, the Fix button will show an error explaining the volume isn't writable.
 
-### Limitations
+### Current Limitations
 
 The auto-fix only updates the `schedule:` line in Kometa collection files. If your collections also have `visible_home`, `visible_shared`, or `visible_library` date ranges, you'll need to update those manually in the YAML files.
 
@@ -178,14 +183,12 @@ The auto-fix only updates the `schedule:` line in Kometa collection files. If yo
 
 ## Troubleshooting
 
-**Collections not showing?**
-Make sure you have collections with "Recommended" visibility enabled in Plex. Curatorr can only reorder collections that are already set to appear on the home screen.
 
 **Changes not applying?**
 Check that you're in `apply` mode, not `dry-run`. Look at the mode indicator (green "Live" vs yellow "Dry-run") in the header.
 
 **Schedule didn't activate?**
-Verify Curatorr was running at the scheduled time. Check the container logs for any errors.
+Verify Curatorr was running at the scheduled time and that you set 'auto-sync' in settings. Check the container logs for any errors.
 
 **Promotion not showing?**
 Promotions only work when their date range is active. Use Preview mode to verify the dates are correct.

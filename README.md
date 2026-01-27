@@ -41,26 +41,11 @@ Edit your `.env` file:
 | `APPLY_MODE` | No | `dry-run` (default) or `apply` |
 | `TZ` | No | Your timezone, e.g. `America/New_York` |
 
-See [GUIDE.md](GUIDE.md) for additional options including password authentication.
-
-## Kometa Integration
-
-If you use Kometa, mount your config folder to enable schedule conflict detection:
-
-```yaml
-# In docker-compose.yaml
-volumes:
-  - plex-scheduler-data:/app/data
-  - /path/to/kometa/config:/kometa/config:ro
-```
-
-Curatorr reads your Kometa YAML files and warns you when a collection's schedule conflicts with your layout block. Mount with `:rw` instead of `:ro` to enable one-click conflict auto-fix
-
-![Kometa Auto-Fix](docs/screenshots/kometa-fix-modal.png)
+See [GUIDE.md](GUIDE.md) for additional options including password authentication and Kometa integration.
 
 ## Known Issues
 
-- Plex's hub reorder API can be flaky - the app retries automatically and results have been good in my testing.
+- Plex's hub reorder API can be flaky - the app retries automatically and confirms state change, which has worked well in testing.
 - Visibility changes may not work on older Plex versions, I'm running latest stable PMS.
 - Kometa-only collections won't appear in plex until Kometa creates them, this app can only change their scheduled dates with the assumption kometa will run. Missing collections are handled gracefully. 
 
