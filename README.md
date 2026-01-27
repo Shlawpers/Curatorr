@@ -10,6 +10,7 @@ A web app for scheduling Plex Home collection layouts. Create scheduled layouts 
 - **Promotions** - Boost specific collections to the top without changing your entire layout
 - **Repeat Yearly** - Schedules automatically repeat every year (set it and forget it)
 - **Drag and Drop** - Reorder collections visually
+- **Collection Pool** - Pull any plex or kometa collection into your home hub's scheduled layout (even kometa collections that aren't currently active in plex)
 - **Visibility Toggles** - Control Home, Shared Home, and Friends visibility separately
 - **Preview Mode** - Time-travel to see what your home will look like at any date
 - **Kometa Integration** - Detects schedule conflicts and can auto-fix them
@@ -53,15 +54,15 @@ volumes:
   - /path/to/kometa/config:/kometa/config:ro
 ```
 
-Curatorr reads your Kometa YAML files and warns you when a collection's schedule conflicts with your layout block. Mount with `:rw` instead of `:ro` to enable one-click auto-fix.
+Curatorr reads your Kometa YAML files and warns you when a collection's schedule conflicts with your layout block. Mount with `:rw` instead of `:ro` to enable one-click conflict auto-fix
 
 ![Kometa Auto-Fix](docs/screenshots/kometa-fix-modal.png)
 
 ## Known Issues
 
-- Plex's hub reorder API can be flaky - the app retries automatically
-- Visibility changes may not work on older Plex versions
-- Kometa-only collections won't appear until Kometa creates them in Plex
+- Plex's hub reorder API can be flaky - the app retries automatically and results have been good in my testing.
+- Visibility changes may not work on older Plex versions, I'm running latest stable PMS.
+- Kometa-only collections won't appear in plex until Kometa creates them, this app can only change their scheduled dates with the assumption kometa will run. Missing collections are handled gracefully. 
 
 ## Documentation
 

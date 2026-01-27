@@ -2,7 +2,7 @@
 
 ## What Does This App Do?
 
-Curatorr lets you control the order of collection rows on your Plex home screen - the same rows you see when you open Plex and scroll down past "Continue Watching."
+Curatorr lets you control the order and visibility of collection rows on your Plex home screen - the same rows you see when you open Plex and scroll down past "Continue Watching."
 
 In Plex, these are called **Managed Recommendations** (or "Promoted Hubs"). You can manually drag them around in Plex settings, but there's no way to schedule different layouts for different times.
 
@@ -19,7 +19,7 @@ That's what Curatorr does: schedule your home screen layout to change automatica
 A complete replacement of your Plex home order for a specific date range. When a scheduled layout is active, it completely controls what appears on your home screen.
 
 ### Promotions
-A lightweight overlay that boosts specific collections to the top without changing the rest of your layout. Great for temporary highlights like "Oscar Nominees This Week" without rebuilding your entire layout.
+A lightweight overlay that boosts specific collections to the top without changing the rest of your layout. Great for temporary highlights like "Christmas Classics" without rebuilding your entire layout.
 
 ### Priority Stack
 When multiple things are scheduled, here's what takes priority:
@@ -39,7 +39,7 @@ When you open Curatorr, you'll see your current Plex layout loaded automatically
 
 ### 2. Understanding "Current Plex Layout"
 
-The **Current Plex Layout** item in the left panel represents your normal Plex home screen - what shows when no schedule is active. Click it to see and edit your current live layout.
+The **Current Plex Layout** item in the left panel represents your normal Plex home screen - what shows when no schedule is active. Click it to see and edit your current live layout (which you can also do in plex).
 
 ### 3. Creating a Scheduled Layout
 
@@ -50,7 +50,7 @@ Click the **+** button next to "SCHEDULED LAYOUTS" to create a new one:
 3. Enable **Repeat yearly** if it should happen every year
 4. Click Create
 
-The new schedule starts empty - drag collections from the bottom panel to build your layout.
+The new schedule starts  with the same layout of whatever scheduled layout precedes it chronologically - you can then re-order, change visibility, or drag collections from the bottom panel to build your layout.
 
 ![Schedule Editing](docs/screenshots/schedule-editing.png)
 
