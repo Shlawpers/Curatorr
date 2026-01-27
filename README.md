@@ -4,6 +4,8 @@ A web app for scheduling Plex Home collection layouts. Create "Scheduled Layouts
 
 I built this because I wanted my Halloween collections at the top during October, Christmas stuff in December, etc., without manually rearranging things every time.
 
+![Curatorr Overview](docs/screenshots/main-overview.png)
+
 ## Features
 
 - **Scheduled Layouts** - Save a complete home layout (order + visibility) and schedule it for a date range
@@ -85,10 +87,13 @@ If you run Kometa, mount your config folder to enable schedule conflict detectio
 # In docker-compose.yaml, add this volume:
 volumes:
   - plex-scheduler-data:/app/data
-  - /path/to/your/kometa/config:/kometa/config:ro
+  - /path/to/your/kometa/config:/kometa/config:ro   # Read-only: detect conflicts
+  # Or use :rw to enable auto-fix feature
 ```
 
-The app reads your Kometa YAML files and warns you if you're scheduling a collection during a time when Kometa would delete it.
+The app reads your Kometa YAML files and warns you if you're scheduling a collection during a time when Kometa would delete it. If mounted read-write, you can auto-fix conflicts directly from the UI.
+
+![Kometa Auto-Fix](docs/screenshots/kometa-fix-modal.png)
 
 ## How it works
 

@@ -35,6 +35,8 @@ CURRENT PLEX STATE    - Your baseline when nothing is scheduled
 
 When you open Curatorr, you'll see your current Plex layout loaded automatically. The left panel shows your schedules and promotions, the center shows your collection order, and the right panel shows pending changes.
 
+![Main Overview](docs/screenshots/main-overview.png)
+
 ### 2. Understanding "Current Plex Layout"
 
 The **Current Plex Layout** item in the left panel represents your normal Plex home screen - what shows when no schedule is active. Click it to see and edit your current live layout.
@@ -50,6 +52,8 @@ Click the **+** button next to "SCHEDULED LAYOUTS" to create a new one:
 
 The new schedule starts empty - drag collections from the bottom panel to build your layout.
 
+![Schedule Editing](docs/screenshots/schedule-editing.png)
+
 ### 4. Creating a Promotion
 
 Click the **+** button next to "PROMOTIONS" to create one:
@@ -60,6 +64,8 @@ Click the **+** button next to "PROMOTIONS" to create one:
 4. Click Create
 
 Add the specific collections you want boosted to the top. These will overlay on whatever layout is currently active.
+
+![Promotion Editing](docs/screenshots/promotion-editing.png)
 
 ### 5. Customizing Your Layout
 
@@ -78,6 +84,8 @@ Click **Apply** to push your layout to Plex.
 
 - In **dry-run** mode (yellow badge): Nothing changes, just previews what would happen
 - In **live** mode (green badge): Your Plex home screen updates immediately
+
+![Settings](docs/screenshots/settings.png)
 
 ## Preview Mode
 
@@ -131,6 +139,8 @@ When a conflict is detected, Curatorr suggests a new schedule and offers to fix 
 3. Click **Apply Fix** to update the Kometa YAML file
 
 The fix uses surgical string replacement - only the `schedule:` line changes, preserving all your comments and formatting.
+
+![Kometa Fix Modal](docs/screenshots/kometa-fix-modal.png)
 
 ### Configuring Kometa Access
 
