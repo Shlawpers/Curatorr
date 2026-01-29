@@ -47,6 +47,8 @@ function App() {
   const [selectedBlockId, setSelectedBlockId] = useState<string | null>(null);
   // Track whether we've loaded block items (to know if empty stack means "no items" vs "not loaded yet")
   const [blockItemsLoaded, setBlockItemsLoaded] = useState(false);
+  // Track if we've done initial auto-select for this library session
+  const [didAutoSelectBlock, setDidAutoSelectBlock] = useState(false);
 
   // Promotions state
   const [selectedPromotionId, setSelectedPromotionId] = useState<string | null>(null);
@@ -312,6 +314,7 @@ function App() {
     setSelectedPromotionId(null);
     setHasLocalReorder(false); // Reset local changes flag on library switch
     setBlockItemsLoaded(false);
+    setDidAutoSelectBlock(false); // Reset auto-select flag for new library
   };
 
   // Helper to find collection by hub identifier or rating key
@@ -471,8 +474,9 @@ function App() {
       setIsPreviewMode(false);
       setHasLocalReorder(false);
       setBlockItemsLoaded(false);
+      fetchHubOrder(); // Fetch fresh data when returning to Current Plex Layout
     }
-  }, [layoutBlocks, getLayoutBlockItems, collections, hubOrder, findCollectionByHubId, getTitleFromHubId]);
+  }, [layoutBlocks, getLayoutBlockItems, collections, hubOrder, findCollectionByHubId, getTitleFromHubId, fetchHubOrder]);
 
   const handleCreateBlock = useCallback(async (block: Omit<LayoutBlock, 'id'>): Promise<string> => {
     const result = await createLayoutBlock({
@@ -555,8 +559,10 @@ function App() {
     } else {
       setHasLocalReorder(false);
       setBlockItemsLoaded(false);
+      setIsPreviewMode(false);
+      fetchHubOrder(); // Fetch fresh data when deselecting promotion
     }
-  }, [promotions, getPromotionItems, hubOrder]);
+  }, [promotions, getPromotionItems, hubOrder, fetchHubOrder]);
 
   const handleCreatePromotion = useCallback(async (promotion: PromotionCreate): Promise<string> => {
     const result = await createPromotion(promotion);
@@ -752,12 +758,34 @@ function App() {
       fetchLayoutBlocks();
       fetchSavedLayouts();
       fetchPromotions();
+      // Always fetch diff to know if there's an active block
+      fetchDiff(isPreviewMode ? previewTime : undefined);
       if (isPreviewMode) {
         fetchSnapshot(previewTime);
-        fetchDiff(previewTime);
       }
     }
   }, [selectedLibrary, isPreviewMode, previewTime, fetchCollections, fetchHubOrder, fetchWindowGroups, fetchLayoutBlocks, fetchSavedLayouts, fetchPromotions, fetchSnapshot, fetchDiff]);
+
+  // Auto-select active block when library loads (if there is one)
+  // This ensures user is always editing what will actually be applied
+  useEffect(() => {
+    if (
+      !didAutoSelectBlock &&
+      !diffLoading &&
+      diff?.active_block_id &&
+      layoutBlocks.length > 0 &&
+      !selectedBlockId &&
+      !selectedPromotionId
+    ) {
+      // Find the active block in our loaded blocks
+      const activeBlock = layoutBlocks.find(b => b.id === diff.active_block_id);
+      if (activeBlock) {
+        console.log(`Auto-selecting active block: ${activeBlock.name}`);
+        handleSelectBlock(activeBlock.id);
+        setDidAutoSelectBlock(true);
+      }
+    }
+  }, [diff, diffLoading, layoutBlocks, selectedBlockId, selectedPromotionId, didAutoSelectBlock, handleSelectBlock]);
 
   const handleJumpToNow = () => {
     setPreviewTime(new Date());
@@ -936,6 +964,8 @@ function App() {
                 setSelectedWindowGroupId(null);
                 setSelectedBlockId(null);
                 setSelectedPromotionId(null);
+                setHasLocalReorder(false); // Allow fresh data from Plex
+                fetchHubOrder(); // Fetch fresh data
               }}
               className={`px-2 md:px-3 py-1.5 text-xs md:text-sm transition-colors ${
                 !isPreviewMode

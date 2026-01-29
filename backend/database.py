@@ -1403,8 +1403,16 @@ async def get_active_promotions(
 
             # Handle year boundary (e.g., Dec 15 - Jan 5)
             if adjusted_end < adjusted_start:
-                # Promotion spans year boundary
-                if at_time >= adjusted_start or at_time < adjusted_end.replace(year=current_year + 1):
+                # Promotion spans year boundary - check two possible active periods:
+                # 1. Previous cycle: Dec (year-1) to Jan (year)
+                # 2. Current cycle: Dec (year) to Jan (year+1)
+                prev_cycle_start = adjusted_start.replace(year=current_year - 1)
+                prev_cycle_end = adjusted_end  # Jan of current_year
+                curr_cycle_start = adjusted_start  # Dec of current_year
+                curr_cycle_end = adjusted_end.replace(year=current_year + 1)  # Jan of next year
+
+                if (prev_cycle_start <= at_time < prev_cycle_end) or \
+                   (curr_cycle_start <= at_time < curr_cycle_end):
                     active.append(promo)
             else:
                 # Normal case

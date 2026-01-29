@@ -416,6 +416,37 @@ class PlexClient:
             logger.error(f"Failed to move hub: {e}")
             return False
 
+    async def delete_hub(
+        self,
+        section_id: str,
+        hub_identifier: str,
+    ) -> tuple[bool, str]:
+        """
+        Delete a managed hub entirely from the library.
+
+        This removes the hub from the managed hubs list, not just hides it.
+        Only works for deletable hubs (collections), not built-in hubs.
+
+        Endpoint: DELETE /hubs/sections/{sectionId}/manage/{hubIdentifier}
+
+        Returns: (success: bool, error_message: str)
+        """
+        if settings.apply_mode == "dry-run":
+            logger.info(f"[DRY-RUN] Would delete hub {hub_identifier}")
+            return True, ""
+
+        try:
+            await self._request(
+                "DELETE",
+                f"/hubs/sections/{section_id}/manage/{hub_identifier}",
+            )
+            logger.info(f"Deleted hub {hub_identifier}")
+            return True, ""
+        except Exception as e:
+            error = f"Failed to delete hub {hub_identifier}: {e}"
+            logger.error(error)
+            return False, str(e)
+
     async def reorder_hubs_with_verify(
         self,
         section_id: str,

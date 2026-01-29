@@ -118,6 +118,10 @@ export interface Diff {
   computed_at: string;
   target_time: string;
   library_section_id: string;
+  no_active_block: boolean;
+  active_block_id: string | null;
+  active_block_name: string | null;
+  active_promotions: Array<{ id: string; name: string; repeat_yearly: boolean }>;
   visibility_changes: VisibilityChange[];
   order_changes: OrderChange[];
   total_changes: number;

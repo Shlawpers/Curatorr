@@ -1344,18 +1344,43 @@ async def apply_changes(section_id: str):
                             "source_name": merged_item.source_name,
                         })
 
-        # Find hubs that should be hidden (currently promoted but not in merged layout)
+        # Build set of ALL hub identifiers in merged layout (not just visible ones)
+        all_layout_hub_ids = set()
+        for item in merged_items:
+            all_layout_hub_ids.add(item.hub_identifier)
+            # Also add the full Plex format if item uses short format
+            if not item.hub_identifier.startswith("custom.collection.") and item.hub_identifier.isdigit():
+                all_layout_hub_ids.add(f"custom.collection.{section_id}.{item.hub_identifier}")
+
+        # Find hubs that should be removed (not in merged layout at all)
+        # For collection hubs not in the layout, DELETE them entirely
+        # For built-in hubs that are promoted but not in layout, just hide them
+        hubs_to_delete = []
         for hub in current_state.hubs:
-            if hub.promoted and hub.hub_identifier not in desired_promoted_hubs:
-                hub_visibility_changes.append({
-                    "hub_id": hub.hub_identifier,
-                    "title": hub.title,
-                    "visible_home": False,
-                    "visible_shared_home": False,
-                    "visible_shared_friends": False,
-                    "source": "auto",
-                    "source_name": "Not in active layout",
-                })
+            hub_in_layout = (
+                hub.hub_identifier in all_layout_hub_ids or
+                hub.hub_identifier in desired_promoted_hubs
+            )
+
+            if not hub_in_layout:
+                # Check if this is a deletable collection hub
+                is_collection = hub.hub_identifier.startswith("custom.collection.")
+                if is_collection:
+                    hubs_to_delete.append({
+                        "hub_id": hub.hub_identifier,
+                        "title": hub.title,
+                    })
+                elif hub.promoted:
+                    # Built-in hub that's promoted but not in layout - just hide it
+                    hub_visibility_changes.append({
+                        "hub_id": hub.hub_identifier,
+                        "title": hub.title,
+                        "visible_home": False,
+                        "visible_shared_home": False,
+                        "visible_shared_friends": False,
+                        "source": "auto",
+                        "source_name": "Not in active layout",
+                    })
 
         # Apply visibility changes
         for change in hub_visibility_changes:
@@ -1372,6 +1397,23 @@ async def apply_changes(section_id: str):
                 result.visibility_failed += 1
                 result.error_messages.append(
                     f"Failed to set visibility for {change['title']}: {error_msg}"
+                )
+
+        # Delete collection hubs not in the layout
+        hubs_deleted = 0
+        hubs_delete_failed = 0
+        for hub_to_delete in hubs_to_delete:
+            success, error_msg = await plex_client.delete_hub(
+                section_id,
+                hub_to_delete["hub_id"],
+            )
+            if success:
+                hubs_deleted += 1
+                logger.info(f"Deleted hub '{hub_to_delete['title']}' not in active layout")
+            else:
+                hubs_delete_failed += 1
+                result.error_messages.append(
+                    f"Failed to delete hub '{hub_to_delete['title']}': {error_msg}"
                 )
 
         # Apply reorder
@@ -1413,6 +1455,9 @@ async def apply_changes(section_id: str):
             "hubs_creation_failed": len(hubs_creation_failed),
             "created_hubs": hubs_created,
             "failed_creations": hubs_creation_failed,
+            # Hub deletion results (collections not in layout)
+            "hubs_deleted": hubs_deleted,
+            "hubs_delete_failed": hubs_delete_failed,
             # Visibility results
             "visibility_applied": result.visibility_applied,
             "visibility_failed": result.visibility_failed,
