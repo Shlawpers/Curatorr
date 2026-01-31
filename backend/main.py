@@ -1240,7 +1240,9 @@ async def apply_changes(section_id: str):
             return hub_identifier
 
         for merged_item in merged_items:
-            collection = collection_map.get(merged_item.hub_identifier)
+            # Extract rating key for lookups - handles both "custom.collection.11.138563" and "138563" formats
+            rating_key = extract_rating_key(merged_item.hub_identifier)
+            collection = collection_map.get(rating_key)
             hub_id = None
             hub = None
 
@@ -1249,10 +1251,10 @@ async def apply_changes(section_id: str):
                 hub_id = merged_item.hub_identifier
                 hub = current_hubs_by_id[hub_id]
 
-            # Method 2: Find hub by collection ID in hub_key
+            # Method 2: Find hub by collection ID (rating_key) in hub_key
             if not hub_id:
                 for h in current_state.hubs:
-                    if f"collections/{merged_item.hub_identifier}" in h.hub_key:
+                    if f"collections/{rating_key}" in h.hub_key:
                         hub_id = h.hub_identifier
                         hub = h
                         break
@@ -1697,7 +1699,9 @@ async def apply_if_needed_internal(section_id: str) -> ApplyIfNeededResult:
 
         # Process each merged item
         for merged_item in merged_items:
-            collection = collection_map.get(merged_item.hub_identifier)
+            # Extract rating key for lookups - handles both "custom.collection.11.138563" and "138563" formats
+            rating_key = extract_rating_key(merged_item.hub_identifier)
+            collection = collection_map.get(rating_key)
             hub_id = None
             hub = None
 
@@ -1705,10 +1709,10 @@ async def apply_if_needed_internal(section_id: str) -> ApplyIfNeededResult:
             if merged_item.hub_identifier in current_hubs_by_id:
                 hub_id = merged_item.hub_identifier
                 hub = current_hubs_by_id[merged_item.hub_identifier]
-            # Find hub by hub_key
+            # Find hub by hub_key (using extracted rating_key)
             if not hub_id:
                 for h in current_state.hubs:
-                    if f"collections/{merged_item.hub_identifier}" in h.hub_key:
+                    if f"collections/{rating_key}" in h.hub_key:
                         hub_id = h.hub_identifier
                         hub = h
                         break
@@ -1721,9 +1725,7 @@ async def apply_if_needed_internal(section_id: str) -> ApplyIfNeededResult:
             if not hub_id:
                 # Hub not in managed list - may need first-time promotion
                 needs_promotion = merged_item.visible_home or merged_item.visible_shared_home or merged_item.visible_shared_friends
-                if needs_promotion:
-                    rating_key = extract_rating_key(merged_item.hub_identifier)
-                    if rating_key.isdigit():
+                if needs_promotion and rating_key.isdigit():
                         visibility_changes_needed.append({
                             "type": "create",
                             "hub_identifier": merged_item.hub_identifier,

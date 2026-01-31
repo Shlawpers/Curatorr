@@ -2,7 +2,7 @@
 import aiosqlite
 import json
 import os
-from datetime import datetime, date, time, timezone
+from datetime import datetime, date, time, timezone, timedelta
 from typing import Optional
 from pathlib import Path
 import logging
@@ -1380,19 +1380,26 @@ async def get_active_promotions(
     all_promotions = await get_promotions(library_section_id)
     active = []
 
-    # Make at_time timezone-naive for comparison
-    if at_time.tzinfo is not None:
-        at_time = at_time.replace(tzinfo=None)
+    # Convert at_time to UTC for consistent comparison
+    # Promotion times are stored in UTC (+00:00), so we need at_time in UTC too
+    if at_time.tzinfo is None:
+        # Naive datetime - assume it's local time, convert to UTC
+        # (same approach as get_active_layout_block)
+        local_offset = datetime.now().astimezone().utcoffset()
+        at_time = at_time - local_offset
+    else:
+        # Aware datetime - convert to UTC and strip timezone
+        at_time = at_time.astimezone(timezone.utc).replace(tzinfo=None)
 
     for promo in all_promotions:
         start = promo.start_at
         end = promo.end_at
 
-        # Make datetimes timezone-naive
+        # Convert to UTC naive for comparison (promotion times are stored as UTC)
         if start.tzinfo is not None:
-            start = start.replace(tzinfo=None)
+            start = start.astimezone(timezone.utc).replace(tzinfo=None)
         if end.tzinfo is not None:
-            end = end.replace(tzinfo=None)
+            end = end.astimezone(timezone.utc).replace(tzinfo=None)
 
         if promo.repeat_yearly:
             # For yearly repeating, check if current month/day falls in range

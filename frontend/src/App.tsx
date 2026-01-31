@@ -525,8 +525,9 @@ function App() {
         if (promotionItems && promotionItems.length > 0) {
           // Convert promotion items to HomeStackItems
           const items: HomeStackItem[] = promotionItems.map((item) => {
-            const hub = hubOrder?.hubs.find(h => h.hub_identifier === item.hub_identifier);
-            const title = hub?.title || item.hub_identifier;
+            // Use getTitleFromHubId which checks collections first, then hubs, then falls back to ID
+            // This ensures we get proper titles even for collections not currently promoted in Plex
+            const title = getTitleFromHubId(item.hub_identifier);
             return {
               id: item.hub_identifier,
               hubIdentifier: item.hub_identifier,
@@ -562,7 +563,7 @@ function App() {
       setIsPreviewMode(false);
       fetchHubOrder(); // Fetch fresh data when deselecting promotion
     }
-  }, [promotions, getPromotionItems, hubOrder, fetchHubOrder]);
+  }, [promotions, getPromotionItems, hubOrder, fetchHubOrder, getTitleFromHubId]);
 
   const handleCreatePromotion = useCallback(async (promotion: PromotionCreate): Promise<string> => {
     const result = await createPromotion(promotion);
