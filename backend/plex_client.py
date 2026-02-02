@@ -487,14 +487,15 @@ class PlexClient:
         for attempt in range(settings.max_reorder_retries + 1):
             result.attempts = attempt + 1
 
-            # Apply moves
+            # Apply moves with delay between each to let Plex process
             for hub_id, after_id in moves:
                 success = await self.move_hub(section_id, hub_id, after_id)
                 if not success:
                     result.error_message = f"Move API call failed for {hub_id}"
+                await asyncio.sleep(0.15)  # 150ms between moves
 
-            # Small delay to let Plex process
-            await asyncio.sleep(0.1)
+            # Additional delay before verification
+            await asyncio.sleep(0.2)
 
             # Verify
             new_state = await self.get_managed_hubs(section_id)
@@ -535,7 +536,10 @@ class PlexClient:
         Compute minimal move operations to transform current order to desired.
 
         Returns list of (hub_to_move, place_after_this_hub) tuples.
-        Empty string for place_after means move to start.
+
+        NOTE: Moves to START (after="") are unreliable in Plex API.
+        When we need item X at position 0, instead of moving X to START,
+        we move the current item at position 0 to be AFTER X.
 
         Uses a greedy approach: iterate through desired order,
         move items that aren't in the right position.
@@ -552,11 +556,23 @@ class PlexClient:
                 # Need to move this hub
                 working.remove(hub_id)
                 if i == 0:
-                    after = ""
+                    # WORKAROUND: Moving to START is unreliable
+                    # Instead, move the current first item AFTER this one
+                    # This effectively makes hub_id the first item
+                    if working:
+                        current_first = working[0]
+                        # Move current_first after hub_id (hub_id goes to position 0)
+                        moves.append((current_first, hub_id))
+                        working.remove(current_first)
+                        working.insert(0, hub_id)
+                        working.insert(1, current_first)
+                    else:
+                        # List is empty, just insert
+                        working.insert(0, hub_id)
                 else:
                     after = desired[i - 1]
-                moves.append((hub_id, after))
-                working.insert(i, hub_id)
+                    moves.append((hub_id, after))
+                    working.insert(i, hub_id)
 
         return moves
 
