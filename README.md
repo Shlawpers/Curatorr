@@ -53,6 +53,10 @@ See [GUIDE.md](GUIDE.md) for additional options including password authenticatio
 
 - **[User Guide](GUIDE.md)** - Detailed usage instructions, tips, and troubleshooting
 
+## Acknowledgments
+
+- Hub reordering recovery pattern inspired by [Agregarr](https://github.com/agregarr/agregarr) - their solution to Plex's float precision convergence issue saved significant debugging time
+
 ## License
 
 MIT

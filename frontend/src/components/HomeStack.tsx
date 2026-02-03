@@ -21,7 +21,14 @@ import {
 } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
 import { restrictToVerticalAxis, restrictToParentElement } from '@dnd-kit/modifiers';
-import { GripVertical, Trash2, Home, Users, UserPlus } from 'lucide-react';
+import { GripVertical, Trash2, Home, Users, UserPlus, EyeOff, Lock } from 'lucide-react';
+
+// Helper to detect built-in Plex hubs (can't be deleted, only hidden)
+function isBuiltInHub(hubIdentifier: string): boolean {
+  // Collections start with "custom.collection."
+  // Everything else is a built-in Plex hub (movie.*, tv.*, show.*, recent.*, etc.)
+  return !hubIdentifier.startsWith('custom.collection.');
+}
 
 export interface HomeStackItem {
   id: string;
@@ -183,6 +190,12 @@ function StackItemContent({
           {item.title}
         </p>
         <div className="flex items-center gap-2 mt-0.5">
+          {isBuiltInHub(item.hubIdentifier) && (
+            <span className="text-[10px] px-1 py-0.5 bg-orange-500/20 text-orange-400 rounded flex items-center gap-0.5" title="Built-in Plex hub - can be hidden but not deleted">
+              <Lock className="w-2.5 h-2.5" />
+              Built-in
+            </span>
+          )}
           {item.source === 'kometa' && (
             <span className="text-[10px] px-1 py-0.5 bg-purple-500/20 text-purple-400 rounded">Kometa</span>
           )}
@@ -198,16 +211,25 @@ function StackItemContent({
       </div>
 
       {/* Remove Button - hidden in read-only mode */}
+      {/* Built-in hubs show "Hide" (EyeOff), collections show "Remove" (Trash2) */}
       {!isReadOnly && (
         <button
           onClick={(e) => {
             e.stopPropagation();
             if (!isDragOverlay) onRemove(item.id);
           }}
-          className="p-1.5 text-gray-500 hover:text-red-400 rounded opacity-0 group-hover:opacity-100 transition-opacity"
-          title="Remove"
+          className={`p-1.5 rounded opacity-0 group-hover:opacity-100 transition-opacity ${
+            isBuiltInHub(item.hubIdentifier)
+              ? 'text-gray-500 hover:text-orange-400'
+              : 'text-gray-500 hover:text-red-400'
+          }`}
+          title={isBuiltInHub(item.hubIdentifier) ? "Hide (built-in hubs can't be deleted)" : "Remove from layout"}
         >
-          <Trash2 className="w-4 h-4" />
+          {isBuiltInHub(item.hubIdentifier) ? (
+            <EyeOff className="w-4 h-4" />
+          ) : (
+            <Trash2 className="w-4 h-4" />
+          )}
         </button>
       )}
     </div>

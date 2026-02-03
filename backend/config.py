@@ -58,6 +58,12 @@ class Settings(BaseSettings):
     # Feature flags
     simulate_reorder_failure: bool = False  # For testing error paths
 
+    # Convergence recovery settings (Agregarr pattern)
+    # When hub moves fail due to Plex float precision convergence,
+    # these settings control automatic recovery via unpromote/re-promote
+    enable_convergence_recovery: bool = True  # Use unpromote/re-promote recovery
+    max_recovery_attempts: int = 2  # Per-hub recovery limit before nuclear reset
+
     # Authentication (optional - disabled by default)
     # Set CURATORR_AUTH_ENABLED=true to require password login
     auth_enabled: bool = False

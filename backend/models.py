@@ -321,6 +321,7 @@ class SyncResultStatus(str, Enum):
     APPLIED = "applied"  # Changes were applied successfully
     NO_ACTIVE_BLOCK = "no_active_block"  # No block active, did nothing
     ERROR = "error"  # Sync failed
+    VERIFIED = "verified"  # Legacy status - kept for backward compatibility
 
 
 class LibrarySyncSettings(BaseModel):

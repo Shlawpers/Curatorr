@@ -544,6 +544,39 @@ async def get_collections(section_id: str, include_kometa: bool = True):
 
                 result.append(collection)
 
+        # Add built-in Plex hubs (movie.recentlyadded, etc.) so they can be added to layouts
+        # These are hubs that exist in Plex but aren't user-created collections
+        try:
+            managed_hubs = await plex_client.get_managed_hubs(section_id)
+            seen_hub_ids = {c.id for c in result}  # Don't duplicate collections
+
+            for hub in managed_hubs.hubs:
+                # Skip collection hubs (already covered above)
+                if hub.hub_identifier.startswith("custom.collection."):
+                    continue
+
+                # Skip if somehow already in result
+                if hub.hub_identifier in seen_hub_ids:
+                    continue
+
+                # Add built-in hub as a "collection" for the UI
+                # Use hub_identifier as the ID (e.g., "movie.recentlyadded")
+                builtin_collection = ScheduledCollection(
+                    id=hub.hub_identifier,
+                    title=hub.title,
+                    source=CollectionSource.PLEX,
+                    library_section_id=section_id,
+                    base_order_index=9999,  # Sort to end by default
+                    windows=[],
+                    thumb=None,
+                    child_count=0,
+                    smart=False,
+                    kometa_file=None,
+                )
+                result.append(builtin_collection)
+        except Exception as e:
+            logger.warning(f"Could not fetch built-in hubs for section {section_id}: {e}")
+
         # Sort by base order
         result.sort(key=lambda c: c.base_order_index)
 
@@ -1323,9 +1356,11 @@ async def apply_changes(section_id: str):
                     continue
 
             if hub_id:
-                # Only add to order if visible_home is true
+                # Add ALL items to the order (not just visible_home)
+                # Plex maintains positions for all managed hubs regardless of visibility
+                # (Aligned with Agregarr's battle-tested approach)
+                desired_hub_order.append(hub_id)
                 if merged_item.visible_home:
-                    desired_hub_order.append(hub_id)
                     desired_promoted_hubs.add(hub_id)
 
                 # Check if any visibility flag needs to change
@@ -1383,6 +1418,12 @@ async def apply_changes(section_id: str):
                         "source": "auto",
                         "source_name": "Not in active layout",
                     })
+                    # Also add hidden built-in hubs to the END of desired order
+                    # This ensures they don't stay in the middle of visible hubs
+                    # Built-in hubs can't be deleted, only hidden, so they must be ordered
+                    if hub.hub_identifier not in desired_hub_order:
+                        desired_hub_order.append(hub.hub_identifier)
+                        logger.debug(f"Appended hidden built-in hub '{hub.hub_identifier}' to end of order")
 
         # Apply visibility changes
         for change in hub_visibility_changes:
@@ -1736,9 +1777,10 @@ async def apply_if_needed_internal(section_id: str) -> ApplyIfNeededResult:
                         })
                 continue
 
-            # Track desired order
+            # Track desired order - ALL items, not just visible_home
+            # Plex maintains positions for all managed hubs regardless of visibility
+            desired_hub_order.append(hub_id)
             if merged_item.visible_home:
-                desired_hub_order.append(hub_id)
                 desired_promoted_hubs.add(hub_id)
 
             # Check visibility changes
@@ -1769,10 +1811,19 @@ async def apply_if_needed_internal(section_id: str) -> ApplyIfNeededResult:
                     "visible_shared_home": False,
                     "visible_shared_friends": False,
                 })
+                # For built-in hubs (non-collection), also add them to the END of desired order
+                # Built-in hubs can't be deleted, only hidden, so they must be positioned
+                # This prevents hidden built-in hubs from staying in the middle of visible hubs
+                is_collection = hub.hub_identifier.startswith("custom.collection.")
+                if not is_collection and hub.hub_identifier not in desired_hub_order:
+                    desired_hub_order.append(hub.hub_identifier)
+                    logger.debug(f"Appended hidden built-in hub '{hub.hub_identifier}' to end of order")
 
-        # Check order changes
-        current_promoted_order = [h for h in current_state.hub_order if h in desired_promoted_hubs]
-        order_changed = current_promoted_order != desired_hub_order
+        # Check order changes - compare items that are in both lists
+        # Filter current order to only items we're managing (in our desired order)
+        desired_hub_set = set(desired_hub_order)
+        current_managed_order = [h for h in current_state.hub_order if h in desired_hub_set]
+        order_changed = current_managed_order != desired_hub_order
 
         # If no changes needed, return IN_SYNC
         if not visibility_changes_needed and not order_changed:
@@ -1826,8 +1877,8 @@ async def apply_if_needed_internal(section_id: str) -> ApplyIfNeededResult:
                 )
                 if success:
                     visibility_applied += 1
-                    # Add to order if visible_home
-                    if change["visible_home"] and created_hub:
+                    # Add ALL created hubs to order tracking
+                    if created_hub:
                         desired_hub_order.append(created_hub)
             else:
                 success, error = await plex_client.set_hub_visibility(

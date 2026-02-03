@@ -1,6 +1,15 @@
 import { useState, useMemo } from 'react';
-import { Search, Plus, Filter } from 'lucide-react';
+import { Search, Plus, Filter, Lock } from 'lucide-react';
 import type { Collection, CollectionSource } from '../types';
+
+// Helper to detect built-in Plex hubs (can't be deleted, only hidden)
+function isBuiltInHub(id: string): boolean {
+  // Collections have numeric IDs or start with "custom.collection." or "kometa:"
+  // Built-in hubs have IDs like "movie.recentlyadded", "tv.ondeck", etc.
+  return !id.startsWith('custom.collection.') &&
+         !id.startsWith('kometa:') &&
+         isNaN(Number(id));
+}
 
 interface Props {
   collections: Collection[];
@@ -103,7 +112,14 @@ export function AvailableCollections({ collections, onAdd, homeStackTitles }: Pr
                 <div className="flex-1 min-w-0">
                   <p className="text-sm font-medium truncate">{collection.title}</p>
                   <div className="flex items-center gap-1 mt-0.5">
-                    {getSourceBadge(collection.source)}
+                    {isBuiltInHub(collection.id) ? (
+                      <span className="text-[10px] px-1 py-0.5 bg-orange-500/20 text-orange-400 rounded flex items-center gap-0.5" title="Built-in Plex hub">
+                        <Lock className="w-2.5 h-2.5" />
+                        Built-in
+                      </span>
+                    ) : (
+                      getSourceBadge(collection.source)
+                    )}
                     {collection.child_count > 0 && (
                       <span className="text-[10px] text-gray-500">
                         {collection.child_count} items
