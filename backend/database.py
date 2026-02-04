@@ -30,6 +30,72 @@ logger = logging.getLogger(__name__)
 DATABASE_PATH = Path(os.environ.get("DATABASE_PATH", "./plex_scheduler.db"))
 
 
+def ensure_utc(dt: datetime) -> datetime:
+    """
+    Ensure a datetime is in UTC (naive, for database comparison).
+
+    - If naive: assumes local time, converts to UTC
+    - If aware: converts to UTC and strips tzinfo
+
+    Returns a naive datetime representing UTC time.
+    """
+    if dt.tzinfo is None:
+        # Naive datetime - assume local time, convert to UTC
+        local_offset = datetime.now().astimezone().utcoffset()
+        return dt - local_offset
+    else:
+        # Aware datetime - convert to UTC and strip timezone
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def check_yearly_repeat_active(
+    start: datetime,
+    end: datetime,
+    at_time_utc: datetime
+) -> bool:
+    """
+    Check if a yearly repeating range is active at the given time.
+
+    Args:
+        start: Start datetime (UTC naive, original year doesn't matter for month/day)
+        end: End datetime (UTC naive, original year doesn't matter for month/day)
+        at_time_utc: The time to check (UTC naive)
+
+    Returns:
+        True if the time falls within the yearly range
+
+    Handles year boundaries correctly:
+    - Dec 15 - Jan 5, checked in December: checks Dec current_year to Jan current_year+1
+    - Dec 15 - Jan 5, checked in January: checks Dec previous_year to Jan current_year
+    - Dec 15 - Jan 5, checked in June: returns False
+    """
+    current_year = at_time_utc.year
+
+    # Detect year boundary: start month > end month (e.g., Dec -> Jan)
+    year_boundary = (start.month > end.month) or \
+                   (start.month == end.month and start.day > end.day)
+
+    if year_boundary:
+        # Determine which cycle to check based on current month
+        if at_time_utc.month >= start.month:
+            # We're in the "late year" part (e.g., December)
+            # Check: Dec current_year to Jan next_year
+            adjusted_start = start.replace(year=current_year)
+            adjusted_end = end.replace(year=current_year + 1)
+        else:
+            # We're in the "early year" part (e.g., January)
+            # Check: Dec previous_year to Jan current_year
+            adjusted_start = start.replace(year=current_year - 1)
+            adjusted_end = end.replace(year=current_year)
+
+        return adjusted_start <= at_time_utc < adjusted_end
+    else:
+        # No year boundary - simple same-year comparison
+        adjusted_start = start.replace(year=current_year)
+        adjusted_end = end.replace(year=current_year)
+        return adjusted_start <= at_time_utc < adjusted_end
+
+
 async def init_database():
     """Initialize database schema."""
     async with aiosqlite.connect(DATABASE_PATH) as db:
@@ -818,13 +884,8 @@ async def get_active_layout_block(
         ) as cursor:
             rows = await cursor.fetchall()
 
-            # Make at_time timezone-aware if it isn't
-            if at_time.tzinfo is None:
-                # Assume local time, convert to UTC for comparison
-                local_offset = datetime.now().astimezone().utcoffset()
-                at_time_utc = at_time - local_offset
-            else:
-                at_time_utc = at_time.astimezone(timezone.utc).replace(tzinfo=None)
+            # Convert at_time to UTC for consistent comparison
+            at_time_utc = ensure_utc(at_time)
 
             for row in rows:
                 # Parse stored datetime (may have timezone info)
@@ -844,31 +905,8 @@ async def get_active_layout_block(
                 is_active = False
 
                 if repeat_yearly:
-                    # For yearly blocks, check if current month/day falls within range
-                    # Adjust block dates to the current year for comparison
-                    current_year = at_time_utc.year
-
-                    # Handle year boundary (e.g., Dec 15 - Jan 5)
-                    if start_at.month > end_at.month or (start_at.month == end_at.month and start_at.day > end_at.day):
-                        # Block spans year boundary
-                        # Check if we're in the late part of the year (after start)
-                        adjusted_start = start_at.replace(year=current_year)
-                        adjusted_end = end_at.replace(year=current_year + 1)
-
-                        if adjusted_start <= at_time_utc < adjusted_end:
-                            is_active = True
-                        else:
-                            # Or we might be in early part of year (before end)
-                            adjusted_start_prev = start_at.replace(year=current_year - 1)
-                            adjusted_end_prev = end_at.replace(year=current_year)
-                            if adjusted_start_prev <= at_time_utc < adjusted_end_prev:
-                                is_active = True
-                    else:
-                        # Block within same year
-                        adjusted_start = start_at.replace(year=current_year)
-                        adjusted_end = end_at.replace(year=current_year)
-                        if adjusted_start <= at_time_utc < adjusted_end:
-                            is_active = True
+                    # Use shared helper for year boundary logic
+                    is_active = check_yearly_repeat_active(start_at, end_at, at_time_utc)
                 else:
                     # Standard non-repeating check
                     if start_at <= at_time_utc < end_at:
@@ -1381,15 +1419,7 @@ async def get_active_promotions(
     active = []
 
     # Convert at_time to UTC for consistent comparison
-    # Promotion times are stored in UTC (+00:00), so we need at_time in UTC too
-    if at_time.tzinfo is None:
-        # Naive datetime - assume it's local time, convert to UTC
-        # (same approach as get_active_layout_block)
-        local_offset = datetime.now().astimezone().utcoffset()
-        at_time = at_time - local_offset
-    else:
-        # Aware datetime - convert to UTC and strip timezone
-        at_time = at_time.astimezone(timezone.utc).replace(tzinfo=None)
+    at_time_utc = ensure_utc(at_time)
 
     for promo in all_promotions:
         start = promo.start_at
@@ -1402,35 +1432,56 @@ async def get_active_promotions(
             end = end.astimezone(timezone.utc).replace(tzinfo=None)
 
         if promo.repeat_yearly:
-            # For yearly repeating, check if current month/day falls in range
-            # Adjust the year to match at_time
-            current_year = at_time.year
-            adjusted_start = start.replace(year=current_year)
-            adjusted_end = end.replace(year=current_year)
-
-            # Handle year boundary (e.g., Dec 15 - Jan 5)
-            if adjusted_end < adjusted_start:
-                # Promotion spans year boundary - check two possible active periods:
-                # 1. Previous cycle: Dec (year-1) to Jan (year)
-                # 2. Current cycle: Dec (year) to Jan (year+1)
-                prev_cycle_start = adjusted_start.replace(year=current_year - 1)
-                prev_cycle_end = adjusted_end  # Jan of current_year
-                curr_cycle_start = adjusted_start  # Dec of current_year
-                curr_cycle_end = adjusted_end.replace(year=current_year + 1)  # Jan of next year
-
-                if (prev_cycle_start <= at_time < prev_cycle_end) or \
-                   (curr_cycle_start <= at_time < curr_cycle_end):
-                    active.append(promo)
-            else:
-                # Normal case
-                if adjusted_start <= at_time < adjusted_end:
-                    active.append(promo)
+            # Use shared helper for year boundary logic
+            if check_yearly_repeat_active(start, end, at_time_utc):
+                active.append(promo)
         else:
             # One-time promotion
-            if start <= at_time < end:
+            if start <= at_time_utc < end:
                 active.append(promo)
 
     return active
+
+
+# ================== Unmanaged Hub Detection (Fix 5) ==================
+
+async def get_all_known_hub_identifiers(library_section_id: str) -> set[str]:
+    """
+    Get all hub identifiers that are tracked in any layout block or promotion.
+
+    This is used to detect "unmanaged" hubs - collections that exist in Plex
+    but aren't part of any Curatorr layout.
+
+    Returns:
+        Set of hub_identifier strings from both layout_block_items and promotion_items
+    """
+    known = set()
+
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        # Get collection_ids from layout block items
+        # Note: layout_block_items uses 'collection_id' which is the hub_identifier
+        async with db.execute("""
+            SELECT DISTINCT lbi.collection_id
+            FROM layout_block_items lbi
+            JOIN layout_blocks lb ON lbi.block_id = lb.id
+            WHERE lb.library_section_id = ?
+        """, (library_section_id,)) as cursor:
+            rows = await cursor.fetchall()
+            for row in rows:
+                known.add(row[0])
+
+        # Get hub identifiers from promotion items
+        async with db.execute("""
+            SELECT DISTINCT pi.hub_identifier
+            FROM promotion_items pi
+            JOIN promotions p ON pi.promotion_id = p.id
+            WHERE p.library_section_id = ?
+        """, (library_section_id,)) as cursor:
+            rows = await cursor.fetchall()
+            for row in rows:
+                known.add(row[0])
+
+    return known
 
 
 # ================== Saved Layouts ==================

@@ -500,7 +500,8 @@ class PlexClient:
         if not success:
             return False, f"Recovery failed during delete: {error}"
 
-        await asyncio.sleep(0.2)  # Let Plex process the deletion
+        # Let Plex process the deletion (use configured delay)
+        await asyncio.sleep(settings.recovery_delay_ms / 1000)
 
         # Step 2: Re-promote it (this gives fresh positioning)
         success, error, new_hub_id = await self.create_hub(
@@ -583,15 +584,17 @@ class PlexClient:
         hub_visibility: dict[str, tuple[bool, bool, bool]] = None,
     ) -> ReorderResult:
         """
-        Attempt to reorder hubs with verification, recovery, and retry.
+        Attempt to reorder hubs with per-move verification and recovery.
 
-        This is the core ordering function that implements the Agregarr pattern:
+        Implements the Agregarr pattern correctly:
         1. Reads current order
-        2. Computes minimal moves needed
-        3. Applies each move with immediate verification
-        4. If a move fails due to float convergence, recovers via unpromote/re-promote
-        5. If recovery fails repeatedly, falls back to nuclear reset + rebuild
-        6. Returns explicit success/failure status
+        2. For each item out of position:
+           a. Move it
+           b. Verify the move immediately
+           c. If verification fails, recover that hub via unpromote/re-promote
+           d. Update state tracking before next move
+        3. If recovery fails repeatedly, falls back to nuclear reset + rebuild
+        4. Returns explicit success/failure status
 
         Args:
             section_id: The library section ID
@@ -628,141 +631,209 @@ class PlexClient:
             result.success = True
             return result
 
-        # Step 2: Two-phase move computation
-        # Phase 1: Position collections correctly (these we can verify and recover)
-        # Phase 2: Best-effort positioning of built-in hubs
         def is_collection_hub(h: str) -> bool:
             return h.startswith("custom.collection.")
 
         # Separate collections and built-in hubs
         desired_collections = [h for h in desired_order if is_collection_hub(h)]
         desired_builtin = [h for h in desired_order if not is_collection_hub(h)]
-        current_collections = [h for h in before_order if is_collection_hub(h)]
-        current_builtin = [h for h in before_order if not is_collection_hub(h) and h in set(desired_builtin)]
 
-        # Compute moves for collections (primary - these we verify)
-        collection_moves = self._compute_minimal_moves(current_collections, desired_collections)
+        # Track current state incrementally (key Agregarr insight)
+        current_order = before_order.copy()
 
-        # Compute moves for built-in hubs (best-effort - not verified)
-        # Only move built-in hubs relative to each other and collections
-        builtin_moves = []
-        for i, hub_id in enumerate(desired_builtin):
-            # Find where this built-in hub should go
-            # Look for the item before it in desired_order
+        logger.info(f"Starting reorder: {len(desired_collections)} collections, {len(desired_builtin)} built-in hubs")
+
+        # Step 2: Process each collection in desired order with per-move verification
+        result.attempts = 1
+        move_count = 0
+
+        for i, hub_id in enumerate(desired_collections):
+            if hub_id not in current_order:
+                logger.warning(f"Hub {hub_id} not in current order, skipping")
+                continue
+
+            # Find expected predecessor
+            expected_predecessor = desired_collections[i - 1] if i > 0 else None
+
+            # Check if already in correct position
+            current_pos = current_order.index(hub_id)
+            if expected_predecessor:
+                if expected_predecessor in current_order:
+                    pred_pos = current_order.index(expected_predecessor)
+                    if current_pos == pred_pos + 1:
+                        continue  # Already correct
+                else:
+                    continue  # Predecessor not found, skip
+            else:
+                # First item - check if it's first among collections
+                collections_in_current = [h for h in current_order if is_collection_hub(h)]
+                if collections_in_current and collections_in_current[0] == hub_id:
+                    continue  # Already first
+
+            # Need to move this hub
+            after_id = expected_predecessor or ""
+
+            # Handle first position specially (moving to START is unreliable)
+            if not after_id and current_order:
+                # Find current first collection and move IT after this hub instead
+                current_collections = [h for h in current_order if is_collection_hub(h)]
+                if current_collections and current_collections[0] != hub_id:
+                    # Move the current first collection after this hub
+                    first_coll = current_collections[0]
+                    logger.debug(f"First position: moving {first_coll} after {hub_id}")
+                    await self.move_hub(section_id, first_coll, hub_id)
+                    move_count += 1
+                    await asyncio.sleep(settings.move_delay_ms / 1000)
+                    # Update tracking
+                    current_order.remove(first_coll)
+                    hub_pos = current_order.index(hub_id)
+                    current_order.insert(hub_pos + 1, first_coll)
+                    continue
+
+            # Standard move: place hub after predecessor
+            logger.debug(f"Moving {hub_id} after {after_id or 'START'}")
+            await self.move_hub(section_id, hub_id, after_id)
+            move_count += 1
+            await asyncio.sleep(settings.move_delay_ms / 1000)
+
+            # Per-move verification (Agregarr pattern)
+            await asyncio.sleep(settings.verify_delay_ms / 1000)
+            verify_state = await self.get_managed_hubs(section_id)
+            actual_order = verify_state.hub_order
+
+            # Check if hub landed in correct position
+            placement_ok = False
+            if hub_id in actual_order:
+                actual_pos = actual_order.index(hub_id)
+                if after_id:
+                    if after_id in actual_order:
+                        pred_actual_pos = actual_order.index(after_id)
+                        placement_ok = (actual_pos == pred_actual_pos + 1)
+                else:
+                    # Should be first collection
+                    actual_collections = [h for h in actual_order if is_collection_hub(h)]
+                    placement_ok = actual_collections and actual_collections[0] == hub_id
+
+            if placement_ok:
+                # Update our tracking with actual state
+                current_order = actual_order.copy()
+            else:
+                # Move failed - likely float precision convergence
+                logger.warning(
+                    f"Move verification failed for {hub_id} - attempting recovery"
+                )
+
+                if settings.enable_convergence_recovery and is_collection_hub(hub_id):
+                    result.recovery_actions += 1
+                    vis = hub_visibility.get(hub_id, (True, True, True))
+
+                    # Unpromote and re-promote to get fresh spacing
+                    success, new_hub_id = await self.recover_hub_position(
+                        section_id, hub_id, vis[0], vis[1], vis[2]
+                    )
+                    await asyncio.sleep(settings.recovery_delay_ms / 1000)
+
+                    if success:
+                        logger.info(f"Recovery successful for {hub_id}")
+                        # Re-fetch state after recovery
+                        verify_state = await self.get_managed_hubs(section_id)
+                        current_order = verify_state.hub_order.copy()
+                    else:
+                        logger.error(f"Recovery failed for {hub_id}")
+                        current_order = actual_order.copy()
+                else:
+                    current_order = actual_order.copy()
+
+        # Step 3: Position built-in hubs (best effort, no verification)
+        for hub_id in desired_builtin:
+            if hub_id not in current_order:
+                continue
+
             desired_idx = desired_order.index(hub_id)
             if desired_idx > 0:
                 after_hub = desired_order[desired_idx - 1]
-                builtin_moves.append((hub_id, after_hub))
+                if after_hub in current_order:
+                    await self.move_hub(section_id, hub_id, after_hub)
+                    move_count += 1
+                    await asyncio.sleep(settings.move_delay_ms / 1000)
 
-        logger.info(f"Computed {len(collection_moves)} collection moves + {len(builtin_moves)} built-in moves")
+        logger.info(f"Completed {move_count} moves, {result.recovery_actions} recoveries")
 
-        # Step 3: Apply moves in two phases, then verify
-        for attempt in range(settings.max_reorder_retries + 1):
-            result.attempts = attempt + 1
-
-            # Phase 1: Apply collection moves (these are verified)
-            for hub_id, after_id in collection_moves:
-                success = await self.move_hub(section_id, hub_id, after_id)
-                if not success:
-                    logger.error(f"Move API call failed for {hub_id}")
-                await asyncio.sleep(0.15)
-
-            # Phase 2: Apply built-in hub moves (best effort, not verified)
-            for hub_id, after_id in builtin_moves:
-                await self.move_hub(section_id, hub_id, after_id)
-                await asyncio.sleep(0.15)
-
-            # Single verification after all moves complete
-            await asyncio.sleep(0.2)
-            new_state = await self.get_managed_hubs(section_id)
-            result.after_order = new_state.hub_order
-
-            actual_collections = [h for h in new_state.hub_order if is_collection_hub(h) and h in set(desired_collections)]
-
-            if actual_collections == desired_collections:
-                result.success = True
-                logger.info(
-                    f"Reorder successful after {result.attempts} attempt(s), "
-                    f"{result.recovery_actions} recovery actions, "
-                    f"nuclear reset: {result.nuclear_reset_used}"
-                )
-                return result
-
-            # Order doesn't match - try recovery if enabled
-            if settings.enable_convergence_recovery and attempt < settings.max_reorder_retries:
-                # Find which hubs are misplaced
-                misplaced = []
-                for i, hub_id in enumerate(desired_collections):
-                    if i >= len(actual_collections) or actual_collections[i] != hub_id:
-                        misplaced.append(hub_id)
-
-                if misplaced:
-                    logger.warning(f"Found {len(misplaced)} misplaced hubs, attempting recovery")
-
-                    # Try recovery on misplaced hubs (limit to first few to avoid excessive calls)
-                    for hub_id in misplaced[:3]:  # Recover max 3 hubs per attempt
-                        if not is_collection_hub(hub_id):
-                            continue
-
-                        vis = hub_visibility.get(hub_id, (True, True, True))
-                        result.recovery_actions += 1
-
-                        success, _ = await self.recover_hub_position(
-                            section_id, hub_id, vis[0], vis[1], vis[2]
-                        )
-                        if success:
-                            logger.info(f"Recovery completed for {hub_id}")
-                        await asyncio.sleep(0.1)
-
-                    # Recompute collection moves for next attempt
-                    new_state = await self.get_managed_hubs(section_id)
-                    current_collections = [h for h in new_state.hub_order if is_collection_hub(h)]
-                    collection_moves = self._compute_minimal_moves(current_collections, desired_collections)
-
-            # If still failing after recovery attempts, try nuclear reset
-            if attempt == settings.max_reorder_retries - 1 and settings.enable_convergence_recovery:
-                logger.warning("Recovery attempts exhausted, trying nuclear reset")
-                result.nuclear_reset_used = True
-
-                if await self.reset_hub_management(section_id):
-                    await asyncio.sleep(0.3)
-
-                    # Re-promote ALL collection hubs in desired order
-                    # (built-in hubs will reappear at default positions)
-                    for hub_id in desired_collections:
-                        vis = hub_visibility.get(hub_id, (True, True, True))
-                        parts = hub_id.split(".")
-                        if len(parts) >= 4:
-                            rating_key = parts[-1]
-                            await self.create_hub(section_id, rating_key, vis[0], vis[1], vis[2])
-                            await asyncio.sleep(0.1)
-
-                    # After nuclear rebuild, recompute collection moves
-                    new_state = await self.get_managed_hubs(section_id)
-                    current_collections = [h for h in new_state.hub_order if is_collection_hub(h)]
-                    collection_moves = self._compute_minimal_moves(current_collections, desired_collections)
-
-            # Retry delay
-            if attempt < settings.max_reorder_retries:
-                delay_ms = settings.retry_delay_ms[min(attempt, len(settings.retry_delay_ms) - 1)]
-                logger.warning(
-                    f"Reorder verification failed, retrying in {delay_ms}ms "
-                    f"(attempt {attempt + 1}/{settings.max_reorder_retries + 1})"
-                )
-                await asyncio.sleep(delay_ms / 1000)
-
-        # All retries exhausted
-        # Get final state for error message
+        # Step 4: Final verification
+        await asyncio.sleep(settings.verify_delay_ms / 1000)
         final_state = await self.get_managed_hubs(section_id)
         result.after_order = final_state.hub_order
 
-        final_actual_collections = [h for h in final_state.hub_order if is_collection_hub(h) and h in set(desired_collections)]
+        actual_collections = [h for h in final_state.hub_order if is_collection_hub(h) and h in set(desired_collections)]
 
+        if actual_collections == desired_collections:
+            result.success = True
+            logger.info(
+                f"Reorder successful: {move_count} moves, "
+                f"{result.recovery_actions} recovery actions"
+            )
+            return result
+
+        # Step 5: If still misaligned and recovery is enabled, try nuclear reset
+        if settings.enable_convergence_recovery and result.recovery_actions > 0:
+            logger.warning(
+                f"Order still incorrect after {result.recovery_actions} recoveries, "
+                "attempting nuclear reset"
+            )
+            result.nuclear_reset_used = True
+            result.attempts = 2
+
+            if await self.reset_hub_management(section_id):
+                # Wait for Plex to process reset
+                await asyncio.sleep(settings.nuclear_reset_delay_ms / 1000)
+
+                # Re-promote collections in desired order (gives fresh sequential spacing)
+                for hub_id in desired_collections:
+                    vis = hub_visibility.get(hub_id, (True, True, True))
+                    parts = hub_id.split(".")
+                    if len(parts) >= 4:
+                        rating_key = parts[-1]
+                        await self.create_hub(section_id, rating_key, vis[0], vis[1], vis[2])
+                        await asyncio.sleep(settings.rebuild_delay_ms / 1000)
+
+                # Wait for Plex to settle after rebuild
+                await asyncio.sleep(settings.rebuild_settle_delay_ms / 1000)
+
+                # Re-position built-in hubs
+                rebuild_state = await self.get_managed_hubs(section_id)
+                current_order = rebuild_state.hub_order
+
+                for hub_id in desired_builtin:
+                    if hub_id not in current_order:
+                        continue
+                    desired_idx = desired_order.index(hub_id)
+                    if desired_idx > 0:
+                        after_hub = desired_order[desired_idx - 1]
+                        if after_hub in current_order:
+                            await self.move_hub(section_id, hub_id, after_hub)
+                            await asyncio.sleep(settings.move_delay_ms / 1000)
+
+                # Final verification after nuclear rebuild
+                await asyncio.sleep(settings.rebuild_settle_delay_ms / 1000)
+                final_state = await self.get_managed_hubs(section_id)
+                result.after_order = final_state.hub_order
+
+                actual_collections = [h for h in final_state.hub_order if is_collection_hub(h) and h in set(desired_collections)]
+
+                if actual_collections == desired_collections:
+                    result.success = True
+                    logger.info(
+                        f"Reorder successful after nuclear reset: "
+                        f"{result.recovery_actions} recoveries"
+                    )
+                    return result
+
+        # All recovery attempts failed
         result.error_message = (
             f"Reorder failed after {result.attempts} attempts, "
             f"{result.recovery_actions} recovery actions, "
             f"nuclear reset: {result.nuclear_reset_used}. "
-            f"Collection order mismatch: expected {desired_collections}, got {final_actual_collections}"
+            f"Collection order mismatch: expected {desired_collections}, got {actual_collections}"
         )
         logger.error(result.error_message)
         return result

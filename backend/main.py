@@ -1,4 +1,5 @@
 """Main FastAPI application for Plex Collection Scheduler."""
+import asyncio
 import os
 import uuid
 import secrets
@@ -95,8 +96,22 @@ from database import (
     get_saved_layout,
     create_saved_layout,
     delete_saved_layout,
+    # Unmanaged Hub Detection
+    get_all_known_hub_identifiers,
 )
 from sync_scheduler import scheduler
+
+# ================== Library Locks (Fix 4: Prevent Race Conditions) ==================
+
+_library_locks: dict[str, asyncio.Lock] = {}
+
+
+def get_library_lock(section_id: str) -> asyncio.Lock:
+    """Get or create a lock for a library to prevent concurrent applies."""
+    if section_id not in _library_locks:
+        _library_locks[section_id] = asyncio.Lock()
+    return _library_locks[section_id]
+
 
 # ================== Promotion Merge Helper ==================
 
@@ -1425,6 +1440,30 @@ async def apply_changes(section_id: str):
                         desired_hub_order.append(hub.hub_identifier)
                         logger.debug(f"Appended hidden built-in hub '{hub.hub_identifier}' to end of order")
 
+        # Option C Fix: Ensure ALL built-in hubs are managed, even if not in layout
+        # Built-in hubs can't be deleted from Plex, only hidden. If they're not in our
+        # layout, we need to explicitly position them at the end with visibility OFF
+        # to prevent them from "drifting" to random positions.
+        for hub in current_state.hubs:
+            is_collection = hub.hub_identifier.startswith("custom.collection.")
+            if not is_collection and hub.hub_identifier not in desired_hub_order:
+                # This built-in hub isn't in our layout at all - add to end
+                desired_hub_order.append(hub.hub_identifier)
+                logger.info(f"Force-managing untracked built-in hub '{hub.title}' ({hub.hub_identifier}) - moving to end")
+
+                # If it has ANY visibility, we need to hide it
+                if hub.promoted_to_own_home or hub.promoted_to_shared_home or hub.promoted_to_recommended:
+                    hub_visibility_changes.append({
+                        "hub_id": hub.hub_identifier,
+                        "title": hub.title,
+                        "visible_home": False,
+                        "visible_shared_home": False,
+                        "visible_shared_friends": False,
+                        "source": "auto",
+                        "source_name": "Untracked built-in hub",
+                    })
+                    logger.info(f"Hiding untracked built-in hub '{hub.title}'")
+
         # Apply visibility changes
         for change in hub_visibility_changes:
             success, error_msg = await plex_client.set_hub_visibility(
@@ -1692,6 +1731,35 @@ async def apply_if_needed_internal(section_id: str) -> ApplyIfNeededResult:
     """
     now = datetime.now()
 
+    # Acquire library lock to prevent concurrent applies (Fix 4)
+    lock = get_library_lock(section_id)
+
+    try:
+        async with asyncio.timeout(120):  # 2 minute timeout to prevent deadlocks
+            async with lock:
+                return await _apply_if_needed_locked(section_id, now)
+    except asyncio.TimeoutError:
+        logger.error(f"apply_if_needed timed out for library {section_id} - lock held too long")
+        return ApplyIfNeededResult(
+            status=SyncResultStatus.ERROR,
+            library_section_id=section_id,
+            checked_at=now,
+            error_message="Operation timed out - lock held too long",
+        )
+    except Exception as e:
+        logger.error(f"apply_if_needed failed for library {section_id}: {e}")
+        return ApplyIfNeededResult(
+            status=SyncResultStatus.ERROR,
+            library_section_id=section_id,
+            checked_at=now,
+            error_message=str(e),
+        )
+
+
+async def _apply_if_needed_locked(section_id: str, now: datetime) -> ApplyIfNeededResult:
+    """
+    Internal implementation that runs while holding the library lock.
+    """
     try:
         # Get merged layout (promotions + block)
         merged_items, active_promotions, active_block = await get_merged_layout(
@@ -1819,6 +1887,29 @@ async def apply_if_needed_internal(section_id: str) -> ApplyIfNeededResult:
                     desired_hub_order.append(hub.hub_identifier)
                     logger.debug(f"Appended hidden built-in hub '{hub.hub_identifier}' to end of order")
 
+        # Option C Fix: Ensure ALL built-in hubs are managed, even if not in layout
+        # Built-in hubs can't be deleted from Plex, only hidden. If they're not in our
+        # layout, we need to explicitly position them at the end with visibility OFF
+        # to prevent them from "drifting" to random positions.
+        for hub in current_state.hubs:
+            is_collection = hub.hub_identifier.startswith("custom.collection.")
+            if not is_collection and hub.hub_identifier not in desired_hub_order:
+                # This built-in hub isn't in our layout at all - add to end
+                desired_hub_order.append(hub.hub_identifier)
+                logger.info(f"Force-managing untracked built-in hub '{hub.title}' ({hub.hub_identifier}) - moving to end")
+
+                # If it has ANY visibility, we need to hide it
+                if hub.promoted_to_own_home or hub.promoted_to_shared_home or hub.promoted_to_recommended:
+                    visibility_changes_needed.append({
+                        "type": "update",
+                        "hub_id": hub.hub_identifier,
+                        "title": hub.title,
+                        "visible_home": False,
+                        "visible_shared_home": False,
+                        "visible_shared_friends": False,
+                    })
+                    logger.info(f"Hiding untracked built-in hub '{hub.title}'")
+
         # Check order changes - compare items that are in both lists
         # Filter current order to only items we're managing (in our desired order)
         desired_hub_set = set(desired_hub_order)
@@ -1898,6 +1989,37 @@ async def apply_if_needed_internal(section_id: str) -> ApplyIfNeededResult:
             if reorder_result.success:
                 order_applied = 1
 
+        # Verify visibility actually took effect (Fix 3 from audit)
+        visibility_mismatches = []
+        if visibility_applied > 0:
+            final_state = await plex_client.get_managed_hubs(section_id)
+            final_hubs_by_id = {h.hub_identifier: h for h in final_state.hubs}
+
+            for merged_item in merged_items:
+                # Find hub in final state
+                hub = final_hubs_by_id.get(merged_item.hub_identifier)
+                if not hub:
+                    # Try to find by rating_key match
+                    rating_key = extract_rating_key(merged_item.hub_identifier)
+                    for h in final_state.hubs:
+                        if f"collections/{rating_key}" in h.hub_key:
+                            hub = h
+                            break
+
+                if hub:
+                    if (hub.promoted_to_own_home != merged_item.visible_home or
+                        hub.promoted_to_shared_home != merged_item.visible_shared_home or
+                        hub.promoted_to_recommended != merged_item.visible_shared_friends):
+                        visibility_mismatches.append(merged_item.hub_identifier)
+                        logger.warning(
+                            f"Visibility mismatch for {merged_item.hub_identifier}: "
+                            f"expected ({merged_item.visible_home}, {merged_item.visible_shared_home}, {merged_item.visible_shared_friends}), "
+                            f"got ({hub.promoted_to_own_home}, {hub.promoted_to_shared_home}, {hub.promoted_to_recommended})"
+                        )
+
+            if visibility_mismatches:
+                logger.warning(f"Visibility mismatch for {len(visibility_mismatches)} hubs after apply")
+
         return ApplyIfNeededResult(
             status=SyncResultStatus.APPLIED,
             library_section_id=section_id,
@@ -1908,6 +2030,7 @@ async def apply_if_needed_internal(section_id: str) -> ApplyIfNeededResult:
             visibility_changes=visibility_applied,
             order_changes=order_applied,
             rollback_snapshot_id=rollback.id,
+            visibility_mismatches=visibility_mismatches,
         )
 
     except Exception as e:
@@ -2004,7 +2127,56 @@ async def trigger_sync_now(section_id: str):
         "order_changes": result.order_changes,
         "error_message": result.error_message,
         "rollback_snapshot_id": result.rollback_snapshot_id,
+        "visibility_mismatches": result.visibility_mismatches,
     }
+
+
+# ================== Unmanaged Hub Detection (Fix 5) ==================
+
+@app.get("/api/libraries/{section_id}/unmanaged-hubs")
+async def get_unmanaged_hubs(section_id: str):
+    """
+    Detect hubs in Plex that aren't tracked in any Curatorr layout block or promotion.
+
+    This is informational only - no automatic action is taken.
+    Users can manually add these to their layouts if desired.
+    """
+    try:
+        # Get current Plex state
+        current_state = await plex_client.get_managed_hubs(section_id)
+
+        # Get all hub identifiers we're tracking
+        known_hubs = await get_all_known_hub_identifiers(section_id)
+
+        # Find unmanaged hubs (in Plex but not in any layout/promotion)
+        unmanaged = []
+        for hub in current_state.hubs:
+            if hub.hub_identifier not in known_hubs:
+                # Also check if the rating_key portion matches
+                # (handles both "custom.collection.11.12345" and "12345" formats)
+                rating_key = hub.hub_identifier.split('.')[-1] if '.' in hub.hub_identifier else hub.hub_identifier
+                full_format = f"custom.collection.{section_id}.{rating_key}"
+
+                if full_format not in known_hubs and rating_key not in known_hubs:
+                    unmanaged.append({
+                        "hub_identifier": hub.hub_identifier,
+                        "title": hub.title,
+                        "promoted": hub.promoted,
+                        "visible_home": hub.promoted_to_own_home,
+                        "visible_shared_home": hub.promoted_to_shared_home,
+                        "visible_shared_friends": hub.promoted_to_recommended,
+                    })
+
+        return {
+            "library_section_id": section_id,
+            "total_plex_hubs": len(current_state.hubs),
+            "total_known_hubs": len(known_hubs),
+            "unmanaged_count": len(unmanaged),
+            "unmanaged_hubs": unmanaged,
+        }
+    except Exception as e:
+        logger.error(f"Error detecting unmanaged hubs for library {section_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ================== Scheduler Control ==================

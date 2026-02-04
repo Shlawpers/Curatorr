@@ -355,6 +355,7 @@ class ApplyIfNeededResult(BaseModel):
     order_changes: int = 0
     error_message: Optional[str] = None
     rollback_snapshot_id: Optional[str] = None
+    visibility_mismatches: list[str] = []  # Hub identifiers where visibility didn't take effect
 
 
 # ================== Promotion Models ==================

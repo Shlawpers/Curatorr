@@ -53,7 +53,7 @@ class Settings(BaseSettings):
 
     # Retry configuration for Plex API writes
     max_reorder_retries: int = 2
-    retry_delay_ms: tuple[int, int] = (250, 750)
+    retry_delay_ms: tuple[int, int] = (500, 1000)  # Increased for Plex stability
 
     # Feature flags
     simulate_reorder_failure: bool = False  # For testing error paths
@@ -63,6 +63,15 @@ class Settings(BaseSettings):
     # these settings control automatic recovery via unpromote/re-promote
     enable_convergence_recovery: bool = True  # Use unpromote/re-promote recovery
     max_recovery_attempts: int = 2  # Per-hub recovery limit before nuclear reset
+
+    # Timing settings (aligned with Agregarr's tested values)
+    # These prevent Plex API hammering that can corrupt hub state
+    move_delay_ms: int = 200  # Delay between individual move operations
+    verify_delay_ms: int = 300  # Delay before verification after a move
+    recovery_delay_ms: int = 500  # Delay after unpromote before re-promote
+    nuclear_reset_delay_ms: int = 1500  # Delay after nuclear reset before rebuild
+    rebuild_delay_ms: int = 200  # Delay between hub recreations during rebuild
+    rebuild_settle_delay_ms: int = 2000  # Final delay after rebuild before verification
 
     # Authentication (optional - disabled by default)
     # Set CURATORR_AUTH_ENABLED=true to require password login

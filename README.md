@@ -43,15 +43,16 @@ Edit your `.env` file:
 
 See [GUIDE.md](GUIDE.md) for additional options including password authentication and Kometa integration.
 
-## Known Issues
+## Known Limitations
 
-- Plex's hub reorder API can be flaky - the app retries automatically and confirms state change, which has worked well in testing.
-- Visibility changes may not work on older Plex versions, I'm running latest stable PMS.
-- Kometa-only collections won't appear in plex until Kometa creates them, this app can only change their scheduled dates with the assumption kometa will run. Missing collections are handled gracefully. 
+- Visibility changes may not work on older Plex versions - tested on latest stable PMS
+- Kometa-only collections won't appear in Plex until Kometa creates them - missing collections are handled gracefully
+- Built-in hubs (Recently Added, Genres, etc.) can only be hidden, not deleted
 
 ## Documentation
 
 - **[User Guide](GUIDE.md)** - Detailed usage instructions, tips, and troubleshooting
+- **[Plex Hub API Reference](docs/PLEX_HUB_API_REFERENCE.md)** - Technical reference for contributors (critical reading before modifying hub logic)
 
 ## Acknowledgments
 
